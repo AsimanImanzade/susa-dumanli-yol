@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Structures viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 12px/1.35 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 8px; top: 8px; max-width: 640px; background: rgba(10, 12, 14, 0.72); padding: 6px 8px; border-radius: 4px; }
+  #ui .row { margin: 2px 0; }
+  #ui button { font: inherit; background: #2a2f33; color: #ddd; border: 1px solid #444; border-radius: 3px; padding: 1px 6px; margin: 1px; cursor: pointer; }
+  #ui button.on { background: #5b6a46; border-color: #8a9a6a; color: #fff; }
+  #info { white-space: pre; font-family: ui-monospace, Menlo, monospace; font-size: 11px; margin-top: 4px; }
+  #ui.hide .row, #ui.hide #info { display: none; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="ui"><div id="rows"></div><div id="info"></div></div>
+<script type="module">
+/*
+ * Dev viewer for structures.js: houses, enterable buildings, the car types and every prop, built with
+ * the real level kit on a flat or sloped street, lit with the game's environment presets.
+ *
+ *   ?show=street|house|building|cars|props|camp|mosque|rampart|all   what to build
+ *   &env=streets|forest|cliffs|dawnStart|dawnEnd|studio              lighting preset
+ *   &cam=<preset>  or  &c=x,y,z,tx,ty,tz                              camera
+ *   &seed=n        shifts every position a little (new variations)
+ *   &shadows=1     sun shadows    &slope=0.022   street slope    &ui=0   hide the panel
+ *
+ * Renders on demand (also in a background tab): window.__viewer.render(), .cam(x,y,z,tx,ty,tz), .stats().
+ */
+import * as THREE from 'three';
+import { G } from '../js/ctx.js';
+import { Level } from '../js/level.js';
+import { initTextures } from '../js/textures.js';
+import { ENV } from '../js/render.js';
+import { buildSoldier } from '../js/soldier-model.js';
+import { structureDebug } from '../js/structures.js';
+
+const q = new URLSearchParams(location.search);
+const S = { show: q.get('show') || 'street', env: q.get('env') || 'streets', cam: q.get('cam') || '', seed: +(q.get('seed') || 0), shadows: q.get('shadows') === '1', slope: +(q.get('slope') ?? 0.022), ui: q.get('ui') !== '0' };
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = S.shadows; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x121a20, 0.03);
+G.scene = scene; G.renderer = renderer;
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.08, 400);
+const hemi = new THREE.HemisphereLight(0x8090a0, 0x2a2a26, 1); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.8); scene.add(sun, sun.target);
+sun.castShadow = S.shadows; sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 1, far: 200 }); sun.shadow.bias = -0.0015;
+const lampLights = []; for (let i = 0; i < 6; i++) { const l = new THREE.PointLight(0xffc98a, 0, 14, 1.4); scene.add(l); lampLights.push(l); }
+
+function setEnv(name) {
+  let A = ENV[name];
+  if (name === 'studio') A = { fog: 0x3a3e42, fogDensity: 0.004, ambient: 0xb8c0c8, ambientI: 1.0, sun: 0xfff2e0, sunI: 1.1, sunDir: [0.5, 0.7, 0.4], exposure: 1 };
+  A = A || ENV.streets;
+  scene.fog.color.set(A.fog); scene.fog.density = A.fogDensity; renderer.setClearColor(A.fog);
+  hemi.color.set(A.ambient); hemi.groundColor.copy(hemi.color).multiplyScalar(0.45); hemi.intensity = A.ambientI * 1.6;
+  sun.color.set(A.sun); sun.intensity = A.sunI * 1.8;
+  sun.userData.dir = new THREE.Vector3(...A.sunDir).normalize();
+  renderer.toneMappingExposure = A.exposure;
+}
+setEnv(S.env);
+
+const textures = initTextures(renderer, null);
+
+// ── the level
+const slope = S.slope, sx = (S.seed * 0.37) % 3, sz = (S.seed * 0.53) % 3;
+const height = (x, z) => (40 - z) * slope + Math.sin(x * 0.21) * Math.cos(z * 0.17) * 0.06;
+const L = new Level(3);
+L.terrain({ bounds: { minX: -90, maxX: 90, minZ: -90, maxZ: 60 }, height, tex: 'cobble', step: 3, surface: () => 'stone', tint: (x) => (Math.abs(x) < 5 ? 0xd8d8d0 : 0xc0c0b8) });
+const shows = S.show === 'all' ? ['street', 'cars', 'props', 'camp', 'building'] : [S.show];
+const t0 = performance.now();
+for (const sh of shows) build(sh);
+function build(sh) {
+  const X = (v) => v + sx, Z = (v) => v + sz;
+  if (sh === 'house') {
+    L.house(X(-17), Z(-12), 15, 14, { wall: 'stone', tint: 0xf0e4cc, lit: true, door: 's' });
+    L.house(X(0), Z(-12), 14, 12, { wall: 'plaster', tint: 0xe6dfd0, lit: true, roof: 'flat', ladder: 'e', ladderAt: 3, door: 's' });
+    L.house(X(17), Z(-12), 15, 14, { wall: 'plaster', tint: 0xd6d6d0, door: 'w' });
+    L.lamp(X(-6), Z(-3), { r: 12 }); L.lamp(X(9), Z(-3), { r: 11 });
+  } else if (sh === 'street') {
+    const tints = [0xffffff, 0xe6dfd0, 0xd6d6d0, 0xf0e4cc, 0xcfc8bc]; let hi = 0;
+    const H = (x, z, w, d, o = {}) => L.house(X(x), Z(z), w, d, { wall: hi % 3 === 1 ? 'plaster' : 'stone', tint: tints[hi++ % tints.length], lit: hi % 4 === 0, floors: 2, ...o });
+    H(-12.5, 28, 15, 24, { door: 'e' }); H(12.5, 28, 15, 24, { door: 'w' });
+    H(-12.5, -4.5, 15, 27, { roof: 'flat', ladder: 'w', ladderAt: -8 }); H(12.5, -4.5, 15, 27, { door: 'w' });
+    H(-37.5, 28, 25, 24, { roof: 'flat', ladder: 'e', ladderAt: 6, door: 's' }); H(-37.5, -4.5, 25, 27, { door: 'n' });
+    L.building(X(37.5), Z(28), 25, 24, { doors: [{ side: 'w', at: 0.5 }, { side: 's', at: -0.4 }], tint: 0xd8d0c0 });
+    L.car(X(-2.6), Z(30), 0.1, 0x55584f); L.car(X(2.8), Z(2), -0.08, 0x4a4d52); L.car(X(2.6), Z(18), 0.05, 0x5a5348);
+    L.sandbags(X(-2.5), Z(12.5), 4.5, 0.05); L.crate(X(-4), Z(20), 1); L.barrel(X(4.4), Z(21)); L.dumpster(X(-22.4), Z(24), Math.PI / 2);
+    L.lamp(X(-5.4), Z(12.5), { r: 12 }); L.lamp(X(5.4), Z(-14), { r: 11 }); L.fence(X(-25), Z(13.5), X(-20.2), Z(13.5), 1.9);
+  } else if (sh === 'building') {
+    L.building(X(0), Z(-12), 18, 14, { doors: [{ side: 's', at: 0 }, { side: 'e', at: 0.3 }], tint: 0xd2cabb });
+  } else if (sh === 'cars') {
+    const types = ['saloon', 'estate', 'niva', 'uaz'];
+    for (let i = 0; i < 4; i++) { structureDebug.carType = types[i]; L.car(X(-9 + i * 6), Z(-6), 0.5, [0x55584f, 0x4a4d52, 0x5a5348, 0x4c4f4a][i]); }
+    structureDebug.carType = null;
+  } else if (sh === 'props') {
+    L.dumpster(X(-12), Z(-6), 0.3); L.barrel(X(-8), Z(-5)); L.barrel(X(-7.3), Z(-5.6)); L.crate(X(-4), Z(-6), 1.1, 0.2); L.crate(X(-2.8), Z(-6.2), 1, 0.6); L.crate(X(-3.5), Z(-6.1), 0.8, 0.1, { y: L.gy(X(-3.5), Z(-6.1)) + 1.05 });
+    L.sandbags(X(2), Z(-5), 5, 0); L.lamp(X(7), Z(-4), { r: 12 }); L.stairs(X(11), Z(-4), 0, 3, 1.1, 2.2);
+    L.barrier('g1', X(-6), Z(-14), X(4), Z(-14)); L.relay(X(9), Z(-12)); L.flagpole(X(15), Z(-10));
+  } else if (sh === 'camp') {
+    L.campfire(X(-4), Z(-6)); L.tent(X(2), Z(-9), 0.5); L.tent(X(-9), Z(-10), 1.2); L.crate(X(-8), Z(-4), 1, 0.3); L.barrel(X(-6.5), Z(-3.4));
+    L.lamp(X(5), Z(-3), { h: 3.6, r: 12, i: 1 }); L.lamp(X(0), Z(-1), { h: 1.0, r: 5, i: 0.5, post: false, color: 0xffb648 }); L.sandbags(X(6), Z(-12), 6, 0.1);
+  } else if (sh === 'mosque') {
+    L.mosque(X(0), Z(-26), -0.25);
+  } else if (sh === 'rampart') {
+    L.rampart(X(-50), Z(-20), X(-5), Z(-20)); L.rampart(X(5), Z(-20), X(50), Z(-20)); L.box(X(-5.2), Z(-20), 2.6, 9, 3, 'stone', { tint: 0xc9c2b0 }); L.box(X(5.2), Z(-20), 2.6, 9, 3, 'stone', { tint: 0xc9c2b0 });
+  }
+}
+const tBuild = performance.now() - t0;
+L.finalize();
+const tTotal = performance.now() - t0;
+
+// ── a 1.8 m figure for scale
+const fig = buildSoldier('friendly', { variant: 0 });
+const fp = (q.get('fig') || '').split(',').map(Number);
+const figPos = fp.length === 2 && !isNaN(fp[0]) ? fp : { street: [0, 10], house: [-6, -3], building: [0, -3], cars: [-6, -3.5], props: [0, -2], camp: [0, -2], mosque: [0, -2], rampart: [0, -14] }[S.show] || [0, -2];
+fig.mesh.position.set(figPos[0], height(figPos[0], figPos[1]), figPos[1]); fig.mesh.rotation.y = 0.4;
+scene.add(fig.mesh);
+for (let i = 0; i < 30; i++) fig.rig.update(1 / 30);
+
+// ── camera
+const CAMS = {
+  street: [0, 1.65, 44, 0, 3, 0], house: [-4, 1.7, 2, -12, 3.5, -12], building: [6, 1.7, 2, 0, 2, -12], cars: [0, 1.7, 4, 0, 0.8, -6], props: [0, 2.2, 6, 0, 0.8, -8], camp: [0, 2, 6, -2, 0.8, -7],
+  mosque: [30, 6, 30, 0, 9, -26], rampart: [0, 1.7, 0, -10, 4, -20],
+  houseClose: [-15, 1.7, -3, -17, 2.4, -5], window: [-13.4, 4.8, -3.6, -13.4, 4.6, -5], door: [-17, 1.6, -3.2, -17, 1.4, -5], roof: [-4, 9, 4, -17, 6, -12], flatroof: [3, 7.6, -14, -4, 6.5, -12],
+  carClose: [-7.5, 1.2, -2.6, -9, 0.7, -6], carRear: [-1, 1.2, -9.8, -3, 0.7, -6], streetEye: [1.5, 1.65, 18, -1, 2.5, 0],
+};
+let C = CAMS[S.cam] || CAMS[S.show] || CAMS.street;
+if (q.has('c')) C = q.get('c').split(',').map(Number);
+function cam(x, y, z, tx, ty, tz) {
+  camera.position.set(x, y, z); camera.lookAt(tx, ty, tz); camera.updateMatrixWorld();
+  // sun shadow frustum follows the target
+  sun.target.position.set(tx, ty, tz); sun.position.set(tx, ty, tz).addScaledVector(sun.userData.dir, 70);
+  // nearest lamps get the point lights
+  const lamps = L.lamps.filter((l) => !l.noLight).map((l) => ({ l, d: (l.x - tx) ** 2 + (l.z - tz) ** 2 })).sort((a, b) => a.d - b.d);
+  lampLights.forEach((pl, i) => { const it = lamps[i]; if (it && S.env !== 'studio') { pl.position.set(it.l.x, it.l.y, it.l.z); pl.color.set(it.l.color || 0xffc98a); pl.intensity = it.l.i * 26; pl.distance = it.l.r * 1.25; } else pl.intensity = 0; });
+  render();
+}
+let orbit = null;
+function render() {
+  renderer.info.reset();
+  renderer.render(scene, camera);
+  info.textContent = `show ${S.show}  env ${S.env}  build ${tBuild.toFixed(0)} ms (finalize incl. ${tTotal.toFixed(0)} ms)  structures ${(L.structureStats.ms).toFixed(0)} ms  tex ${L.structureStats.texMs.toFixed(0)} ms\n` +
+    `calls ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(1)}k  geos ${renderer.info.memory.geometries}  colliders ${L.world.colliders.length}  lamps ${L.lamps.length}`;
+}
+// drag to orbit around the target, wheel to dolly
+const tgt = new THREE.Vector3();
+renderer.domElement.addEventListener('pointerdown', (e) => { orbit = { x: e.clientX, y: e.clientY }; });
+addEventListener('pointerup', () => { orbit = null; });
+addEventListener('pointermove', (e) => {
+  if (!orbit) return;
+  const off = camera.position.clone().sub(tgt), r = off.length();
+  let yaw = Math.atan2(off.x, off.z) - (e.clientX - orbit.x) * 0.006, pitch = Math.asin(off.y / r) + (e.clientY - orbit.y) * 0.005;
+  pitch = Math.max(-0.2, Math.min(1.45, pitch));
+  camera.position.set(tgt.x + Math.sin(yaw) * Math.cos(pitch) * r, tgt.y + Math.sin(pitch) * r, tgt.z + Math.cos(yaw) * Math.cos(pitch) * r);
+  camera.lookAt(tgt); orbit = { x: e.clientX, y: e.clientY }; render();
+});
+addEventListener('wheel', (e) => { const off = camera.position.clone().sub(tgt).multiplyScalar(e.deltaY > 0 ? 1.1 : 0.9); camera.position.copy(tgt).add(off); render(); });
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); render(); });
+
+// ── UI
+function urlWith(k, v) { const u = new URLSearchParams(location.search); u.set(k, v); if (k === 'show') u.delete('cam'), u.delete('c'); return '?' + u.toString(); }
+const rows = document.getElementById('rows'), info = document.getElementById('info');
+const OPTS = { show: ['street', 'house', 'building', 'cars', 'props', 'camp', 'mosque', 'rampart', 'all'], env: ['streets', 'forest', 'dawnStart', 'dawnEnd', 'studio'], cam: Object.keys(CAMS), seed: [0, 1, 2, 3, 4, 5] };
+for (const [k, list] of Object.entries(OPTS)) {
+  const r = document.createElement('div'); r.className = 'row'; r.textContent = k + ': ';
+  for (const v of list) { const b = document.createElement('button'); b.textContent = v; if (String(S[k]) === String(v)) b.className = 'on'; b.onclick = () => { location.search = urlWith(k, v); }; r.appendChild(b); }
+  rows.appendChild(r);
+}
+if (!S.ui) document.getElementById('ui').classList.add('hide');
+function setCam(a) { tgt.set(a[3], a[4], a[5]); cam(...a); }
+setCam(C);
+textures.then(() => render());
+window.__viewer = { THREE, L, scene, camera, renderer, render, cam: (...a) => setCam(a), preset: (n) => setCam(CAMS[n]), CAMS,
+  stats: () => ({ build: tBuild, total: tTotal, st: L.structureStats, calls: renderer.info.render.calls, tris: renderer.info.render.triangles, colliders: L.world.colliders.length }) };
+</script>
+</body>
+</html>

@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Weapon viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: radial-gradient(circle at 50% 40%, #7a7d80, #4b4e51); font: 12px/1.4 ui-monospace, Menlo, monospace; color: #eef; }
+  canvas { display: block; }
+  #info { position: absolute; left: 10px; top: 8px; white-space: pre; text-shadow: 0 1px 2px #000; pointer-events: none; }
+  #xh { position: absolute; left: 50%; top: 50%; width: 15px; height: 15px; margin: -8px 0 0 -8px; pointer-events: none; display: none; }
+  #xh::before, #xh::after { content: ""; position: absolute; background: rgba(255, 40, 40, 0.9); }
+  #xh::before { left: 7px; top: 0; width: 1px; height: 15px; } #xh::after { top: 7px; left: 0; height: 1px; width: 15px; }
+  #links { position: absolute; left: 10px; bottom: 8px; }
+  #links a { color: #cfe; margin-right: 8px; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="info">loading…</div><div id="xh"></div><div id="links"></div>
+<script type="module">
+/**
+ * dev/weapon.html — look at one view model on a neutral backdrop.
+ *   ?w=akm|ak74|svd|pistol|knife   ?view=left|right|top|under|front|back|34|34r|fp|ads|custom (&yaw=&pitch=)
+ *   ?sup=1  ?mag=out  ?slide=back  ?reload=0..1 (reload pose)  ?env=studio|forest|streets|dawn  ?zoom=1  ?all=1
+ *   ?item=frag|smoke|flash|stone|tknife|c4|shell   ?pickup=ammo|medkit|weapon_akm|…   (world models)
+ */
+import * as THREE from 'three';
+import * as WM from '../js/weapon-models.js';
+import * as PM from '../js/pickup-models.js';   // ?item / ?pickup (dev/pickups.html shows them on the ground)
+
+const q = new URLSearchParams(location.search);
+const id = q.get('w') || 'akm', view = q.get('view') || 'left', envName = q.get('env') || 'studio';
+const ENV = {   // view-model light as render.js derives it per act (hemi colour, ground, sun colour, intensities, light level)
+  studio: { sky: 0xb8c0c8, ground: 0x5a5650, sun: 0xfff4e6, hemiI: 1.7, sunI: 1.3, light: 0.85 },
+  forest: { sky: 0x5a6c7c, ground: 0x28303a, sun: 0x8fa6c4, hemiI: 1.7, sunI: 1.3, light: 0.2 },
+  streets: { sky: 0x8090a0, ground: 0x3a4148, sun: 0xa9b8c8, hemiI: 1.7, sunI: 1.3, light: 0.34 },
+  dawn: { sky: 0xb8bcc0, ground: 0x53555a, sun: 0xffd2a0, hemiI: 1.82, sunI: 1.86, light: 0.85 },
+};
+const E = ENV[envName] || ENV.studio;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace; renderer.setClearColor(0x000000, 0);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const hemi = new THREE.HemisphereLight(E.sky, E.ground, E.hemiI), sun = new THREE.DirectionalLight(E.sun, E.sunI);
+sun.position.set(0.4, 1, 0.6);
+scene.add(hemi, sun);
+const env = WM.createVmEnvironment(renderer);
+env.sync(hemi.color, hemi.groundColor, sun.color);
+scene.environment = env.texture;
+scene.environmentIntensity = 0.45 + E.light * 0.8;
+
+WM.DEV.arms = q.get('arms') !== '0';
+const t0 = performance.now();
+const models = [];
+let info = '';
+if (q.get('item') || q.get('pickup')) {
+  const m = q.get('item') ? PM.buildItemModel(q.get('item')) : PM.buildPickupModel(q.get('pickup'), { sup: q.get('sup') === '1' });
+  scene.add(m); models.push({ root: m });
+  let tris = 0, calls = 0; m.traverse((o) => { if (o.isMesh) { calls++; tris += (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3; } });
+  info = `${q.get('item') || q.get('pickup')}  tris ${tris}  meshes ${calls}`;
+} else {
+  const ids = q.get('all') ? ['pistol', 'akm', 'ak74', 'svd', 'knife'] : [id];
+  ids.forEach((w, i) => {
+    const vm = WM.buildViewModel(w);
+    if (vm.sup) vm.sup.visible = q.get('sup') === '1';
+    if (vm.mag && q.get('mag') === 'out') vm.mag.position.y = -0.22;
+    if (vm.slide && q.get('slide') === 'back') vm.slide.position.z = vm.slideTravel;
+    if (q.get('all')) vm.root.position.set(0, -i * 0.22, 0);
+    scene.add(vm.root); models.push(vm);
+    info += `${w}: tris ${vm.stats.tris}  meshes ${vm.stats.calls}  built ${vm.stats.ms} ms   sightY ${vm.sightY}\n`;
+  });
+}
+const buildMs = Math.round(performance.now() - t0);
+
+// framing
+const box = new THREE.Box3();
+for (const m of models) box.expandByObject(m.root);
+const ctr = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3());
+let cam;
+const vm = models[0];
+if (view === 'fp' || view === 'ads') {
+  cam = new THREE.PerspectiveCamera(+(q.get('fov') || 55), innerWidth / innerHeight, 0.01, 10);
+  const r = vm.root;
+  if (view === 'ads') { r.position.set(0, -vm.sightY, vm.adsZ); document.getElementById('xh').style.display = 'block'; }
+  else { r.position.set(vm.hip[0], vm.hip[1], vm.hip[2]); r.rotation.set(...vm.hipRot); }
+  const k = +(q.get('reload') || 0);
+  if (k > 0) {   // the reload pose weapons.js uses
+    const tilt = Math.sin(Math.min(1, k / 0.9) * Math.PI), out = k < 0.22 ? 0 : k < 0.42 ? (k - 0.22) / 0.2 : k < 0.6 ? 1 - (k - 0.42) / 0.18 : 0;
+    r.rotation.set(tilt * 0.22, 0, tilt * 0.35); r.position.y -= tilt * 0.04;
+    if (vm.mag) vm.mag.position.y = -out * 0.22;
+    if (vm.handL) vm.handL.position.set(0.02 * out, -out * 0.2, id === 'pistol' ? 0 : out * 0.2);
+  }
+  if (q.get('sprint')) { r.rotation.y += 0.7; r.rotation.x -= 0.25; r.position.x -= 0.06; r.position.y -= 0.05; }
+} else {
+  const dirs = { left: [-1, 0, 0], right: [1, 0, 0], top: [0, 1, 0.0001], under: [0, -1, 0.0001], front: [0, 0, -1], back: [0, 0, 1], '34': [-0.8, 0.45, 0.55], '34r': [0.8, 0.45, 0.55], '34f': [-0.7, 0.35, -0.65] };
+  let d = new THREE.Vector3(...(dirs[view] || dirs.left));
+  if (view === 'custom') { const y = +(q.get('yaw') || 0), p = +(q.get('pitch') || 0); d.set(Math.sin(y) * Math.cos(p), Math.sin(p), Math.cos(y) * Math.cos(p)); }
+  d.normalize();
+  cam = new THREE.PerspectiveCamera(18, innerWidth / innerHeight, 0.01, 50);
+  const zoom = +(q.get('zoom') || 1), ext = Math.max(size.x, size.y, size.z);
+  const dist = (ext * 0.62 / Math.tan(THREE.MathUtils.degToRad(9)) / Math.max(1, innerWidth / innerHeight) * 1.05 + ext * 0.2) / zoom;
+  const focus = q.get('focus') ? new THREE.Vector3(...q.get('focus').split(',').map(Number)) : ctr;
+  cam.position.copy(focus).addScaledVector(d, dist);
+  cam.up.set(0, 1, 0); if (Math.abs(d.y) > 0.99) cam.up.set(0, 0, -1);
+  cam.lookAt(focus);
+}
+renderer.render(scene, cam);
+const ri = renderer.info.render;
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix(); renderer.render(scene, cam); });
+requestAnimationFrame(() => renderer.render(scene, cam));
+document.getElementById('info').textContent = info + `\nview ${view}  env ${envName}  draw calls ${ri.calls}  tris ${ri.triangles}  total build ${buildMs} ms`;
+window.__viewer = { ready: true, buildMs, calls: ri.calls, tris: ri.triangles };
+const L = document.getElementById('links');
+for (const v of ['left', 'right', 'top', '34', '34r', 'fp', 'ads']) { const a = document.createElement('a'); const p = new URLSearchParams(q); p.set('view', v); a.href = '?' + p; a.textContent = v; L.appendChild(a); }
+</script>
+</body>
+</html>

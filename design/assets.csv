@@ -1,0 +1,35 @@
+id,role,type,description,size/ratio,style line ref,source
+tex_stone,house walls,texture,coursed limestone blocks,256 tile,formula,procedural (textures.js) | generate via design/asset-prompts.md
+tex_plaster,house walls,texture,weathered lime plaster,256 tile,formula,procedural | generate
+tex_cobble,street ground,texture,wet grey cobblestone,256 tile,formula,procedural | generate
+tex_rock,cliffs and boulders,texture,layered limestone rock,256 tile,formula,procedural | generate
+tex_forest,forest ground,texture,damp leaf litter and moss,256 tile,formula,procedural | generate
+tex_roof,gable roofs,texture,rust-red corrugated metal,256 tile,formula,procedural | generate
+tex_wood,fences crates stalls,texture,weathered planks,256 tile,formula,procedural | generate
+tex_misc,dirt metal cloth concrete bark dark,texture,support materials,256 tile,formula,procedural
+tex_flag,flag,texture,Azerbaijani tricolour with crescent and star,512x256,n/a,procedural (canvas)
+mdl_soldier,enemy and friendly soldiers (rifle x3 variants / sniper / officer / friendly x2),3d rigged,smooth-skinned lofted soldier (4 weights/vertex; 20 bones incl. neck clavicles hands feet) with helmet/cap/boonie chest rig or plate carrier pouches belt radio and an AK or SVD on the weapon bone; posed in code: planted-foot walk/run with IK legs; IK hands on the rifle; braced aim; kneel; flinch; stun; three death falls,1.78 m; 5.1k-5.9k tris enemy / ~5.9k friendly,formula,procedural (soldier-model.js; dev viewer public/dev/soldier.html)
+tex_soldier,soldier atlas (camo cloth x2 / webbing / leather / skin / painted face / helmet paint / wood / gun metal),texture,one shared 1024x1024 canvas atlas + baked AO in vertex colours,1024 atlas,formula,procedural (soldier-model.js)
+mdl_pistol,first-person Makarov-pattern pistol (threaded barrel; detachable suppressor) + gloved hands and sleeves,3d,view model ~16.5k tris; PBR (blued steel; chequered bakelite),0.161 m,formula,procedural (weapon-models.js)
+mdl_akm,first-person AKM (laminate; slant compensator) / AK-74 (plum polymer; two-chamber brake) + hands,3d,view model ~23-24k tris; PBR (steel; laminate; polymer),0.88 / 0.94 m,formula,procedural (weapon-models.js)
+mdl_svd,first-person SVD (skeleton stock; cheek rest; slotted flash hider) + PSO-1 style scope (eyecup; turrets; coated lenses),3d,view model ~26k tris; PBR + Physical glass,1.22 m,formula,procedural (weapon-models.js)
+mdl_knife,first-person combat knife (clip point; fuller; guard; ridged handle) + hand,3d,view model ~8.4k tris; PBR,0.25 m,formula,procedural (weapon-models.js)
+mdl_props,crates barrels sandbags cars dumpsters tents lamps ladders stalls relay flagpole,3d,level kit,n/a,formula,procedural (level.js)
+mdl_buildings,houses enterable buildings ramparts mosque,3d,level kit,n/a,formula,procedural (level.js)
+mdl_nature,pines bare trees rocks bushes,3d instanced,vegetation,n/a,formula,procedural
+sfx_weapons,pistol pistol_sup akm ak74 rifle_sup svd enemy_shot,audio,gunshots,0.3-1.9 s,n/a,procedural (audio.js) | generate (credits)
+sfx_handling,dry mag_out mag_in bolt sup_screw switch click,audio,weapon handling,<0.7 s,n/a,procedural
+sfx_body,footsteps x5 land slash stab body cloth hurt heartbeat,audio,movement and melee,<0.9 s,n/a,procedural
+sfx_world,explosion flashbang smoke impact impact_wood whiz bounce stone_hit rocks grip flag,audio,world,<2.6 s,n/a,procedural
+sfx_ui,ui_move ui_ok ui_back pickup heal beep nvg hitmark headshot alert shout,audio,interface and feedback,<0.9 s,n/a,procedural
+sfx_radio,radio_on radio_off radio_voice,audio,radio squelch and chatter,<1.6 s,n/a,procedural
+amb_loops,rain wind fire,audio loop,ambient beds,4-8 s,n/a,procedural
+music_calm,stealth layer,audio loop,D minor drone pad,16 s,n/a,procedural | generate (credits)
+music_tension,suspicious layer,audio loop,pulsing ostinato,16 s,n/a,procedural
+music_combat,combat layer,audio loop,drums and bass ostinato,16 s,n/a,procedural | generate (credits)
+vo_radio,commander radio lines (21 keys r_*),audio,Azerbaijani voice lines,2-5 s,n/a,not generated: subtitles + synthetic chatter | generate vo_<key>
+img_menu,menu background,image,fortress city above foggy cliffs at night,16:9,formula,not generated: CSS gradient | generate
+img_loading1-4,act loading screens,image,forest / cliff / lane / square at dawn,16:9,formula,not generated: CSS gradient | generate
+img_cover,marketplace cover and og image,image,soldier below the fortress at dawn,3:2,formula,pending your approval (credits)
+tex_weapons,view-model materials,texture,steel / laminate / polymer / chequer / cloth / glove detail + packed height-roughness-metal maps,512 and 256 tiles,n/a,procedural (weapon-models.js)
+env_viewmodel,view-model reflections,environment,equirect sky-ground gradient with key and strip lights; re-tinted per act,512x256,n/a,procedural (weapon-models.js)

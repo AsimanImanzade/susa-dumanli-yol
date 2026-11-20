@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Vehicles viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 12px/1.35 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 8px; top: 8px; max-width: 640px; background: rgba(10, 12, 14, 0.72); padding: 6px 8px; border-radius: 4px; }
+  #ui .row { margin: 2px 0; }
+  #ui button { font: inherit; background: #2a2f33; color: #ddd; border: 1px solid #444; border-radius: 3px; padding: 1px 6px; margin: 1px; cursor: pointer; }
+  #ui button.on { background: #5b6a46; border-color: #8a9a6a; color: #fff; }
+  #info { white-space: pre; font-family: ui-monospace, Menlo, monospace; font-size: 11px; margin-top: 4px; }
+  #ui.hide .row, #ui.hide #info { display: none; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="ui"><div id="rows"></div><div id="info"></div></div>
+<script type="module">
+/*
+ * Dev viewer for vehicles.js: the tank (driving a circle, turret sweeping, gun nodding), the BTR-type
+ * carrier, the towed howitzer and the mortar, each with a 1.8 m figure for scale.
+ *
+ *   ?show=tank|apc|gun|mortar|all     what to build      &env=studio|streets|forest|dawnStart   lighting
+ *   &anim=0                            freeze the tank   &wreck=1  show them destroyed (darkened, turret askew)
+ *   &c=x,y,z,tx,ty,tz                  camera            &ui=0     hide the panel
+ *
+ * Drag to orbit, wheel to dolly. window.__viewer: { render(), cam(...), stats(), models }.
+ */
+import * as THREE from 'three';
+import { G } from '../js/ctx.js';
+import { initTextures } from '../js/textures.js';
+import { ENV } from '../js/render.js';
+import { buildTank, buildApc, buildHowitzer, buildMortar, poseTank } from '../js/vehicles.js';
+import { buildSoldier } from '../js/soldier-model.js';
+
+const q = new URLSearchParams(location.search);
+const S = { show: q.get('show') || 'tank', env: q.get('env') || 'studio', anim: q.get('anim') !== '0', wreck: q.get('wreck') === '1', ui: q.get('ui') !== '0' };
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x3a3e42, 0.004);
+G.scene = scene; G.renderer = renderer;
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.08, 400);
+const hemi = new THREE.HemisphereLight(0x8090a0, 0x2a2a26, 1); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1); scene.add(sun, sun.target);
+sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -16, right: 16, top: 16, bottom: -16, near: 1, far: 120 }); sun.shadow.bias = -0.0008;
+
+let A = ENV[S.env];
+if (S.env === 'studio' || !A) A = { fog: 0x3a3e42, fogDensity: 0.004, ambient: 0xb8c0c8, ambientI: 1.0, sun: 0xfff2e0, sunI: 1.1, sunDir: [0.5, 0.7, 0.4], exposure: 1 };
+scene.fog.color.set(A.fog); scene.fog.density = Math.min(A.fogDensity, 0.012); renderer.setClearColor(A.fog);
+hemi.color.set(A.ambient); hemi.groundColor.copy(hemi.color).multiplyScalar(0.45); hemi.intensity = A.ambientI * 1.6;
+sun.color.set(A.sun); sun.intensity = A.sunI * 1.8;
+const sunDir = new THREE.Vector3(...A.sunDir).normalize();
+sun.position.copy(sunDir).multiplyScalar(60); sun.target.position.set(0, 0, 0);
+renderer.toneMappingExposure = A.exposure;
+
+await initTextures(renderer, null);
+// ground
+const gnd = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), new THREE.MeshStandardMaterial({ color: 0x6d6a60, roughness: 0.95 }));
+gnd.rotation.x = -Math.PI / 2; gnd.receiveShadow = true; scene.add(gnd);
+
+// ── the models
+const models = {};
+const place = (m, x, z, ry) => { m.root.position.set(x, 0, z); m.root.rotation.y = ry; m.root.traverse((o) => { if (o.isMesh) o.castShadow = true; }); scene.add(m.root); };
+const all = S.show === 'all';
+if (S.show === 'tank' || all) { models.tank = buildTank(7); place(models.tank, 0, 0, 0.6); }
+if (S.show === 'apc' || all) { models.apc = buildApc(11); place(models.apc, all ? -10 : 0, all ? 4 : 0, -0.5); }
+if (S.show === 'gun' || all) { models.gun = buildHowitzer(13); place(models.gun, all ? 10 : 0, all ? 3 : 0, 2.4); }
+if (S.show === 'mortar' || all) { models.mortar = buildMortar(17); place(models.mortar, all ? 6 : 0, all ? -7 : 0, 2.6); }
+if (S.wreck) for (const m of Object.values(models)) {
+  m.mats.armor.color.setHex(0x3a3631);
+  if (m.turret) { m.turret.position.y += 0.06; m.turret.rotation.set(0.12, 0.7, -0.18); }
+  if (m.glow) m.glow.visible = false;
+  if (m.beam) m.beam.visible = false;
+  if (m.barrel && m.kind !== 'tank') { m.barrel.rotation.x = -0.25; m.barrel.position.set(1.2, 0.3, m.barrel.position.z); }
+  if (m.crates) m.crates.visible = false;
+}
+if (models.tank) { models.tank.glow.visible = S.env !== 'studio' && !S.wreck; models.tank.beam.visible = models.tank.glow.visible; models.tank.spot.intensity = models.tank.glow.visible ? 55 : 0; }
+
+const fig = buildSoldier('friendly', { variant: 0 });
+fig.mesh.position.set(all ? 3 : 3.2, 0, all ? 6 : 2.4); fig.mesh.rotation.y = 0.5; scene.add(fig.mesh);
+for (let i = 0; i < 30; i++) fig.rig.update(1 / 30);
+
+// ── triangle and draw-call count of one tank
+function countOf(root) {
+  let tris = 0, calls = 0;
+  root.traverse((o) => { if (!o.isMesh || !o.geometry.index) return; const n = o.isInstancedMesh ? o.count : 1; tris += o.geometry.index.count / 3 * n; calls++; });
+  return { tris: Math.round(tris), calls };
+}
+
+// ── camera, orbit
+const CAMS = { tank: [7.5, 3.2, 8.5, 0, 1.1, 0], apc: [8, 3.2, 8, 0, 1.1, 0], gun: [6, 2.6, 6, 0, 1, 0], mortar: [3, 1.8, 3, 0, 0.5, 0], all: [0, 9, 22, 0, 1, 0],
+  rear: [-2.5, 2.6, 8.5, 0, 1.2, 0], low: [5.5, 0.6, 5, 0, 0.7, 0], top: [0.1, 12, 0.1, 0, 0, 0] };
+let C = CAMS[q.get('cam')] || CAMS[S.show] || CAMS.tank;
+if (q.has('c')) C = q.get('c').split(',').map(Number);
+const tgt = new THREE.Vector3();
+function cam(x, y, z, tx, ty, tz) { camera.position.set(x, y, z); tgt.set(tx, ty, tz); camera.lookAt(tgt); render(); }
+let orbit = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { orbit = { x: e.clientX, y: e.clientY }; });
+addEventListener('pointerup', () => { orbit = null; });
+addEventListener('pointermove', (e) => {
+  if (!orbit) return;
+  const off = camera.position.clone().sub(tgt), r = off.length();
+  let yaw = Math.atan2(off.x, off.z) - (e.clientX - orbit.x) * 0.006, pitch = Math.asin(off.y / r) + (e.clientY - orbit.y) * 0.005;
+  pitch = Math.max(-0.05, Math.min(1.5, pitch));
+  camera.position.set(tgt.x + Math.sin(yaw) * Math.cos(pitch) * r, tgt.y + Math.sin(pitch) * r, tgt.z + Math.cos(yaw) * Math.cos(pitch) * r);
+  camera.lookAt(tgt); orbit = { x: e.clientX, y: e.clientY };
+});
+addEventListener('wheel', (e) => { const off = camera.position.clone().sub(tgt).multiplyScalar(e.deltaY > 0 ? 1.1 : 0.9); camera.position.copy(tgt).add(off); });
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+const info = document.getElementById('info');
+function render() {
+  renderer.info.reset();
+  renderer.render(scene, camera);
+  const tc = models.tank ? countOf(models.tank.root) : null;
+  info.textContent = `show ${S.show}  env ${S.env}  calls ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(1)}k` + (tc ? `\ntank: ${tc.calls} meshes, ${(tc.tris / 1000).toFixed(1)}k triangles` : '') +
+    Object.entries(models).filter(([k]) => k !== 'tank').map(([k, m]) => { const c = countOf(m.root); return `\n${k}: ${c.calls} meshes, ${(c.tris / 1000).toFixed(1)}k triangles`; }).join('');
+}
+let t = 0, last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (models.tank && S.anim && !S.wreck) {
+    t += dt;
+    const m = models.tank, v = 2.4, w = 0.18;          // a slow circle to the left
+    m.root.rotation.y += w * dt;
+    m.root.position.x += -Math.sin(m.root.rotation.y) * v * dt; m.root.position.z += -Math.cos(m.root.rotation.y) * v * dt;
+    poseTank(m, dt, v - w * 1.4, v + w * 1.4, Math.sin(t * 0.3) * 1.2, 0.05 + Math.sin(t * 0.7) * 0.08);
+  } else if (models.tank) poseTank(models.tank, 0, 0, 0, S.wreck ? 0.7 : 0.4, 0.04);
+  render();
+}
+cam(...C);
+requestAnimationFrame(frame);
+
+// ── UI
+function urlWith(k, v) { const u = new URLSearchParams(location.search); u.set(k, v); if (k === 'show') u.delete('cam'), u.delete('c'); return '?' + u.toString(); }
+const rows = document.getElementById('rows');
+const OPTS = { show: ['tank', 'apc', 'gun', 'mortar', 'all'], env: ['studio', 'streets', 'forest', 'dawnStart'], cam: Object.keys(CAMS), wreck: ['0', '1'], anim: ['1', '0'] };
+for (const [k, list] of Object.entries(OPTS)) {
+  const r = document.createElement('div'); r.className = 'row'; r.textContent = k + ': ';
+  for (const v of list) { const b = document.createElement('button'); b.textContent = v; if (String(q.get(k) ?? ({ show: 'tank', env: 'studio', wreck: '0', anim: '1' })[k]) === String(v)) b.className = 'on'; b.onclick = () => { location.search = urlWith(k, v); }; r.appendChild(b); }
+  rows.appendChild(r);
+}
+if (!S.ui) document.getElementById('ui').classList.add('hide');
+window.__viewer = { THREE, scene, camera, renderer, render, models, cam: (...a) => cam(...a), stats: () => Object.fromEntries(Object.entries(models).map(([k, m]) => [k, countOf(m.root)])) };
+</script>
+</body>
+</html>

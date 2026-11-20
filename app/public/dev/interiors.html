@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Interiors viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 12px/1.35 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 8px; top: 8px; max-width: 640px; background: rgba(10, 12, 14, 0.72); padding: 6px 8px; border-radius: 4px; }
+  #ui .row { margin: 2px 0; }
+  #ui button { font: inherit; background: #2a2f33; color: #ddd; border: 1px solid #444; border-radius: 3px; padding: 1px 6px; margin: 1px; cursor: pointer; }
+  #ui button.on { background: #5b6a46; border-color: #8a9a6a; color: #fff; }
+  #info { white-space: pre; font-family: ui-monospace, Menlo, monospace; font-size: 11px; margin-top: 4px; }
+  #ui.hide .row, #ui.hide #info { display: none; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="ui"><div id="rows"></div><div id="info"></div></div>
+<script type="module">
+/*
+ * Dev viewer for interiors.js: enterable townhouses built with the real level kit on a sloped street,
+ * lit with the game's environment presets. D opens / shuts every door.
+ *
+ *   ?show=street|garrison|tall|hut        what to build
+ *   &env=streets|forest|dawnStart|studio   lighting preset
+ *   &cam=<preset>  or  &c=x,y,z,tx,ty,tz  camera     &shadows=1   &ui=0
+ *
+ * window.__viewer: render(), cam(x,y,z,tx,ty,tz), preset(name), stats(), L (the level), houses.
+ */
+import * as THREE from 'three';
+import { G } from '../js/ctx.js';
+import { Level } from '../js/level.js';
+import { initTextures } from '../js/textures.js';
+import { ENV } from '../js/render.js';
+import { buildSoldier } from '../js/soldier-model.js';
+
+const q = new URLSearchParams(location.search);
+const S = { show: q.get('show') || 'street', env: q.get('env') || 'streets', cam: q.get('cam') || '', shadows: q.get('shadows') === '1', ui: q.get('ui') !== '0' };
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = S.shadows;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x121a20, 0.03);
+G.scene = scene; G.renderer = renderer;
+const camera = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.05, 400);
+const hemi = new THREE.HemisphereLight(0x8090a0, 0x2a2a26, 1); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.8); scene.add(sun, sun.target);
+sun.castShadow = S.shadows; sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -45, right: 45, top: 45, bottom: -45, near: 1, far: 200 }); sun.shadow.bias = -0.0015;
+const lampLights = []; for (let i = 0; i < 8; i++) { const l = new THREE.PointLight(0xffc98a, 0, 10, 1.4); scene.add(l); lampLights.push(l); }
+let A = ENV[S.env];
+if (S.env === 'studio') A = { fog: 0x3a3e42, fogDensity: 0.004, ambient: 0xb8c0c8, ambientI: 1.0, sun: 0xfff2e0, sunI: 1.1, sunDir: [0.5, 0.7, 0.4], exposure: 1 };
+A = A || ENV.streets;
+scene.fog.color.set(A.fog); scene.fog.density = A.fogDensity; renderer.setClearColor(A.fog);
+hemi.color.set(A.ambient); hemi.groundColor.copy(hemi.color).multiplyScalar(0.45); hemi.intensity = A.ambientI * 1.6;
+sun.color.set(A.sun); sun.intensity = A.sunI * 1.8; sun.userData.dir = new THREE.Vector3(...A.sunDir).normalize();
+renderer.toneMappingExposure = A.exposure;
+const textures = initTextures(renderer, null);
+
+// ── the level
+const height = (x, z) => (40 - z) * 0.022 + Math.sin(x * 0.21) * Math.cos(z * 0.17) * 0.06;
+const L = new Level(3);
+L.terrain({ bounds: { minX: -60, maxX: 60, minZ: -60, maxZ: 60 }, height, tex: 'cobble', step: 3, surface: () => 'stone', tint: (x) => (Math.abs(x) < 5 ? 0xd8d8d0 : 0xc0c0b8) });
+const houses = [];
+const t0 = performance.now();
+if (S.show === 'street' || S.show === 'garrison') {
+  houses.push(L.townhouse(-12.5, 0, 15, 24, { door: 'e', back: 'w', low: true, wall: 'stone', tint: 0xf0e4cc, garrison: S.show === 'garrison' }));
+  houses.push(L.townhouse(12.5, 0, 15, 24, { door: 'w', back: 'e', wall: 'plaster', tint: 0xe6dfd0, roof: 'flat', ladder: 'e', ladderAt: 6, garrison: S.show === 'garrison' }));
+} else if (S.show === 'tall') {
+  houses.push(L.townhouse(-12.5, 0, 15, 14, { door: 'e', floors: 3, garrison: true, wall: 'plaster', tint: 0xd6d6d0 }));
+} else if (S.show === 'hut') {
+  houses.push(L.townhouse(0, -6, 6, 5, { floors: 1, door: 's', back: false, wall: 'stone', tint: 0xd8d0c0, lit: 1 }));
+}
+L.lamp(-5.4, 12.5, { r: 12 }); L.lamp(5.4, -14, { r: 11 });
+const tBuild = performance.now() - t0;
+L.finalize();
+// a 1.8 m figure at the first sentry post (or in the first room), for scale
+const h0 = houses[0], post = h0.post(h0.floors - 1, 0) || h0.stand(0);
+const fig = buildSoldier('friendly', { variant: 0 });
+fig.mesh.position.set(post.x, post.y ?? height(post.x, post.z), post.z); fig.mesh.rotation.y = post.face || 0;
+scene.add(fig.mesh); for (let i = 0; i < 30; i++) fig.rig.update(1 / 30);
+
+// ── camera presets, from the first house's plan
+const pl = h0.plan, P3 = (a, y, b) => { const p = pl.Pc(a, b); return [p[0], y, p[1]]; };
+const fl = pl.flights[0];
+const CAMS = {
+  street: [h0.x + 14, 1.7, h0.z + 18, h0.x, 3.5, h0.z],
+  hall: [...P3(pl.ah - 0.6, pl.gyC(pl.ah, pl.ib - 0.8) + 1.6, pl.ib - 0.8), ...P3(pl.ah, pl.fy[0] + 1.2, -2)],
+  stairs: fl ? [...P3(pl.ah - pl.hh + 0.4, pl.fy[0] + 1.6, fl.bFoot + 2), ...P3((fl.a0 + fl.a1) / 2, pl.fy[1], fl.bFoot - fl.run)] : [h0.x, 2, h0.z + 8, h0.x, 1, h0.z],
+  upstairs: [...P3(pl.ah - 0.4, pl.fy[pl.floors - 1] + 1.6, pl.ib - 0.8), ...P3(pl.ah, pl.fy[pl.floors - 1] + 1.2, -3)],
+  post: post.face !== undefined ? [post.x + Math.sin(post.face) * 2.4, post.y + 1.7, post.z + Math.cos(post.face) * 2.4, post.x, post.y + 1.2, post.z] : [h0.x, 2, h0.z + 8, h0.x, 1, h0.z],
+  roof: [h0.x + 18, h0.top + 8, h0.z + 18, h0.x, h0.top - 2, h0.z],
+};
+let C = CAMS[S.cam] || CAMS.street;
+if (q.has('c')) C = q.get('c').split(',').map(Number);
+const info = document.getElementById('info');
+function cam(x, y, z, tx, ty, tz) {
+  camera.position.set(x, y, z); camera.lookAt(tx, ty, tz); camera.updateMatrixWorld();
+  sun.target.position.set(tx, ty, tz); sun.position.set(tx, ty, tz).addScaledVector(sun.userData.dir, 70);
+  const lamps = L.lamps.filter((l) => !l.noLight).map((l) => ({ l, d: (l.x - x) ** 2 + (l.y - y) ** 2 + (l.z - z) ** 2 })).sort((a, b) => a.d - b.d);
+  lampLights.forEach((pt, i) => { const it = lamps[i]; if (it) { pt.position.set(it.l.x, it.l.y, it.l.z); pt.color.set(it.l.color || 0xffc98a); pt.intensity = it.l.i * 26; pt.distance = it.l.r * 1.25; } else pt.intensity = 0; });
+  render();
+}
+function render() {
+  renderer.info.reset(); renderer.render(scene, camera);
+  info.textContent = `show ${S.show}  build ${tBuild.toFixed(0)} ms  calls ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(1)}k  colliders ${L.world.colliders.length}  doors ${L.doorSys ? L.doorSys.doors.length : 0}  lamps ${L.lamps.length}`;
+}
+const rows = document.getElementById('rows');
+const OPTS = { show: ['street', 'garrison', 'tall', 'hut'], env: ['streets', 'forest', 'dawnStart', 'studio'], cam: Object.keys(CAMS) };
+for (const [k, list] of Object.entries(OPTS)) {
+  const r = document.createElement('div'); r.className = 'row'; r.textContent = k + ': ';
+  for (const v of list) {
+    const b = document.createElement('button'); b.textContent = v; if (String(S[k]) === v) b.className = 'on';
+    b.onclick = () => { const u = new URLSearchParams(location.search); u.set(k, v); if (k === 'show') u.delete('cam'); location.search = u; };
+    r.appendChild(b);
+  }
+  rows.appendChild(r);
+}
+// D: open every door / shut them again
+addEventListener('keydown', (e) => {
+  if (e.code !== 'KeyD' || !L.doorSys) return;
+  for (const d of L.doorSys.doors) { d.target = d.target ? 0 : 1; d.ang = d.target ? 1.75 : 0; L.doorSys._pose(d); }
+  render();
+});
+if (!S.ui) document.getElementById('ui').classList.add('hide');
+textures.then(() => cam(...C));
+window.__viewer = { THREE, L, houses, scene, camera, renderer, render, cam: (...a) => cam(...a), preset: (n) => cam(...CAMS[n]), CAMS,
+  stats: () => ({ build: tBuild, calls: renderer.info.render.calls, tris: renderer.info.render.triangles, colliders: L.world.colliders.length }) };
+</script>
+</body>
+</html>

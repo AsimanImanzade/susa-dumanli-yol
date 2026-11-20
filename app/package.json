@@ -1,0 +1,9 @@
+{
+  "name": "susa-dumanli-yol",
+  "private": true,
+  "type": "module",
+  "description": "First-person stealth-action shooter for the browser, built on Three.js.",
+  "scripts": {
+    "test:unit": "node --test tests-node/*.mjs"
+  }
+}

@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nature viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 12px/1.35 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 8px; top: 8px; max-width: 620px; background: rgba(10, 12, 14, 0.72); padding: 6px 8px; border-radius: 4px; }
+  #ui a { color: #9cf; margin-right: 6px; }
+  #info { white-space: pre; font-family: ui-monospace, Menlo, monospace; font-size: 11px; margin-top: 4px; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="ui"><div id="links"></div><div id="info"></div></div>
+<script type="module">
+/*
+ * Nature viewer: all variants of one kind side by side with a 1.8 m reference.
+ * URL params: kind=conifer|deciduous|rock|bush|ground|forest  env=forest|dawnStart|dawnEnd|studio
+ *             cam=eye|near|far|top  anim=1 (wind, continuous render)  ui=0  ground=0
+ * Renders on demand (drag to orbit, wheel to zoom).
+ */
+import * as THREE from 'three';
+import { ENV } from '../js/render.js';
+import { TEX, initTextures } from '../js/textures.js';
+import { buildNature, natureKit } from '../js/nature.js';
+
+const q = new URLSearchParams(location.search);
+const S = { kind: q.get('kind') || 'conifer', env: q.get('env') || 'forest', cam: q.get('cam') || 'eye', anim: q.get('anim') === '1', ui: q.get('ui') !== '0' };
+if (!S.ui) document.getElementById('ui').style.display = 'none';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.LinearToneMapping;
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+initTextures(renderer, {});
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 400);
+scene.fog = new THREE.FogExp2(0x121a20, 0.03);
+const hemi = new THREE.HemisphereLight(0x8090a0, 0x2a2a26, 1); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.8); scene.add(sun, sun.target);
+sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048); sun.shadow.bias = -0.0015;
+Object.assign(sun.shadow.camera, { left: -40, right: 40, top: 40, bottom: -40, near: 1, far: 160 });
+
+const gTex = TEX.forest.clone(); gTex.needsUpdate = true; gTex.repeat.set(100, 100);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshLambertMaterial({ map: gTex, color: 0x9aa388 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+
+function setEnv(name) {
+  if (name === 'studio') {
+    scene.fog.color.set(0x3a3e42); scene.fog.density = 0.004; renderer.setClearColor(0x3a3e42);
+    hemi.color.set(0xb8c0c8); hemi.groundColor.set(0x504c44); hemi.intensity = 1.6; sun.color.set(0xfff2e0); sun.intensity = 2.2; sun.position.set(20, 40, 25);
+    renderer.toneMappingExposure = 1.0; return;
+  }
+  const A = ENV[name] || ENV.forest;
+  scene.fog.color.set(A.fog); scene.fog.density = A.fogDensity; renderer.setClearColor(A.fog);
+  hemi.color.set(A.ambient); hemi.groundColor.copy(hemi.color).multiplyScalar(0.45); hemi.intensity = A.ambientI * 1.6;
+  sun.color.set(A.sun); sun.intensity = A.sunI * 1.8;
+  sun.position.set(A.sunDir[0] * 60, A.sunDir[1] * 60, A.sunDir[2] * 60);
+  renderer.toneMappingExposure = A.exposure;
+}
+setEnv(S.env);
+
+// reference: a 1.8 m figure and a crouching 1.1 m one
+const refMat = new THREE.MeshStandardMaterial({ color: 0x7a6a50, roughness: 0.8 });
+function figure(x, z, h) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, h - 0.44 - 0.24, 4, 8), refMat); body.position.y = (h - 0.24) / 2; g.add(body);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.12, 12, 8), refMat); head.position.y = h - 0.12; g.add(head);
+  g.position.set(x, 0, z); g.traverse((o) => { o.castShadow = true; }); scene.add(g);
+}
+
+// fake level
+const L = { trees: [], rocks: [], bushes: [], indoor: [], noWalkFns: [], gy: () => 0, terrainOpts: { surface: () => 'grass' }, bounds: { minX: -60, maxX: 60, minZ: -60, maxZ: 60 }, group: scene };
+let span = 0, cy = 4;
+const K = S.kind;
+if (K === 'conifer' || K === 'deciduous') {
+  for (let v = 0; v < 4; v++) L.trees.push({ x: (v - 1.5) * 10, z: 0, s: 1, kind: K === 'conifer' ? 0 : 1, r: v * 1.3, v });
+  span = 40; cy = 5.5;
+} else if (K === 'rock') {
+  for (let v = 0; v < 4; v++) L.rocks.push({ x: (v - 1.5) * 4, z: 0, s: 1.4, r: v * 1.1, v });
+  span = 16; cy = 0.7;
+} else if (K === 'bush') {
+  for (let v = 0; v < 4; v++) L.bushes.push({ x: (v - 1.5) * 5.5, z: 0, r: 2, v });
+  span = 22; cy = 0.9;
+} else if (K === 'forest' || K === 'ground') {
+  // a deterministic patch of forest with a path along z
+  const path = (z) => Math.sin(z * 0.08) * 3;
+  L.terrainOpts.surface = (x, z) => (Math.abs(x - path(z)) < 1.6 ? 'dirt' : 'grass');
+  for (let i = 0; i < 160; i++) {
+    const x = (Math.sin(i * 12.9898) * 43758.5453 % 1) * 55, z = (Math.sin(i * 78.233) * 12543.123 % 1) * 55;
+    if (Math.abs(x - path(z)) < 3.5) continue;
+    if (i % 9 === 0) L.rocks.push({ x, z, s: 1 + (i % 5) * 0.2, r: i });
+    else if (i % 7 === 0) L.bushes.push({ x, z, r: 1.6 + (i % 3) * 0.3 });
+    else L.trees.push({ x, z, s: 0.85 + (i % 6) * 0.1, kind: i % 3 === 0 ? 1 : 0, r: i * 2.1 });
+  }
+  span = 20; cy = 1.6;
+}
+if (K !== 'forest' && K !== 'ground') { figure(span / 2 + 1.5, 0, 1.8); figure(span / 2 + 2.6, 0, 1.1); }
+const N = buildNature(L, { group: scene });
+window.__N = N;
+
+// camera
+const tgt = new THREE.Vector3(0, cy, 0);
+let yaw = 0, pitch = 0, dist = { eye: span * 0.95, near: span * 0.45, far: span * 2.2, top: span * 1.2 }[S.cam] || span;
+if (K === 'forest' || K === 'ground') { tgt.set(0, 1.6, -12); dist = 14; pitch = -0.02; }
+if (S.cam === 'top') pitch = 0.9;
+if (q.has('yaw')) yaw = +q.get('yaw');
+if (q.has('pitch')) pitch = +q.get('pitch');
+if (q.has('dist')) dist = +q.get('dist');
+function placeCam() {
+  camera.position.set(tgt.x + Math.sin(yaw) * Math.cos(pitch) * dist, Math.max(0.3, tgt.y + Math.sin(pitch) * dist), tgt.z + Math.cos(yaw) * Math.cos(pitch) * dist);
+  camera.lookAt(tgt);
+}
+let drag = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY }; });
+addEventListener('pointerup', () => { drag = null; });
+addEventListener('pointermove', (e) => { if (!drag) return; yaw -= (e.clientX - drag.x) * 0.005; pitch = Math.max(-0.3, Math.min(1.4, pitch + (e.clientY - drag.y) * 0.005)); drag = { x: e.clientX, y: e.clientY }; render(); });
+addEventListener('wheel', (e) => { dist = Math.max(2, dist * (1 + Math.sign(e.deltaY) * 0.1)); render(); });
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); render(); });
+
+const links = document.getElementById('links');
+for (const k of ['conifer', 'deciduous', 'rock', 'bush', 'forest']) for (const env of ['forest', 'dawnEnd']) {
+  const a = document.createElement('a'); a.href = `?kind=${k}&env=${env}&cam=${S.cam}`; a.textContent = `${k}/${env === 'forest' ? 'night' : 'dawn'}`; links.appendChild(a);
+}
+function render() {
+  placeCam();
+  renderer.render(scene, camera);
+  const i = renderer.info.render, st = N.stats;
+  document.getElementById('info').textContent =
+    `build ${st.ms.toFixed(0)} ms (textures ${st.texMs.toFixed(0)}, kit geo ${st.kitGeoMs.toFixed(0)})  draws ${i.calls}  tris ${i.triangles}\n` +
+    `instances ${JSON.stringify(st.instances)}\n` + Object.entries(st.tris).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n');
+}
+window.__render = render;
+if (q.get('atlas')) {   // show a texture: atlas=leaf|bark|barkn|rock|rockn
+  const kk = natureKit(), t = { leaf: kk.atlas, bark: kk.bark.map, barkn: kk.bark.normal, rock: kk.rockT.map, rockn: kk.rockT.normal }[q.get('atlas')];
+  const c = document.createElement('canvas'); c.width = t.image.width; c.height = t.image.height;
+  const id = new ImageData(new Uint8ClampedArray(t.image.data), c.width, c.height);
+  if (q.get('alpha') !== '1') for (let i = 3; i < id.data.length; i += 4) id.data[i] = 255;
+  c.getContext('2d').putImageData(id, 0, 0);
+  Object.assign(c.style, { position: 'fixed', right: '0', top: '0', height: '100%', background: '#567' }); document.body.appendChild(c);
+}
+render();
+if (S.anim) renderer.setAnimationLoop(render);
+</script>
+</body>
+</html>

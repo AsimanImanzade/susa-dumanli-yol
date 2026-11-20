@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pickup viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; font: 12px/1.4 ui-monospace, Menlo, monospace; color: #eef; }
+  canvas { display: block; }
+  #info { position: absolute; left: 10px; top: 8px; white-space: pre; text-shadow: 0 1px 2px #000; pointer-events: none; }
+  #labels div { position: absolute; transform: translate(-50%, 0); color: #dfe6d8; text-shadow: 0 1px 2px #000; pointer-events: none; white-space: nowrap; }
+  #links { position: absolute; left: 10px; bottom: 8px; }
+  #links a { color: #cfe; margin-right: 8px; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="info">loading…</div><div id="labels"></div><div id="links"></div>
+<script type="module">
+/**
+ * dev/pickups.html — every ground pickup and thrown item on the ground, under the game's lighting.
+ *   ?type=ammo|medkit|weapon_svd|…   one pickup        ?item=frag|smoke|flash|stone|tknife|c4|shell   one item (resting on the ground)
+ *   (neither: all pickups and items in a grid)       ?sup=1 a gun pickup with its suppressor on
+ *   ?env=forest|cliffs|streets|dawnStart|dawnEnd (render.js ENV; default forest)   ?fog=0   ?lamp=1 (a street lamp nearby)
+ *   ?envmap=1 (give the scene an environment map)    ?ground=forest|cobble|dirt|stone
+ *   ?cam=stand|close|far|top|custom (&yaw=&pitch=&dist=&h=)   ?fov=   ?t=seconds (glint phase)   ?anim=1 (pulse the glints)
+ * Renders on demand: drag to orbit, wheel to zoom. window.__viewer has the build stats.
+ */
+import * as THREE from 'three';
+import { ENV } from '../js/render.js';
+import { TEX, TEX_SCALE, initTextures } from '../js/textures.js';
+import { createVmEnvironment } from '../js/weapon-models.js';
+import { buildPickupModel, buildItemModel, PICKUP_TYPES, ITEM_KINDS, STATS, pickupMaterial } from '../js/pickup-models.js';
+
+const q = new URLSearchParams(location.search);
+const E = ENV[q.get('env') || 'forest'] || ENV.forest;
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.LinearToneMapping; renderer.toneMappingExposure = E.exposure;   // the game multiplies by exposure in its post pass
+document.body.appendChild(renderer.domElement);
+initTextures(renderer, null);
+
+// the world lighting exactly as R.setEnv derives it
+const scene = new THREE.Scene();
+const fogC = new THREE.Color(E.fog);
+if (q.get('fog') !== '0') scene.fog = new THREE.FogExp2(fogC, E.fogDensity);
+scene.background = fogC;
+const hemi = new THREE.HemisphereLight(E.ambient, new THREE.Color(E.ambient).multiplyScalar(0.45), E.ambientI * 1.6);
+const sun = new THREE.DirectionalLight(E.sun, E.sunI * 1.8);
+sun.position.set(...E.sunDir).multiplyScalar(20);
+scene.add(hemi, sun);
+if (q.get('lamp') === '1') { const l = new THREE.PointLight(0xffc98a, 26, 15, 1.4); l.position.set(-3, 3.6, -2); scene.add(l); }
+if (q.get('envmap') === '1') {
+  const env = createVmEnvironment(renderer); env.sync(hemi.color, hemi.groundColor, sun.color);
+  scene.environment = env.texture; scene.environmentIntensity = 0.02 + Math.pow(E.light, 1.5) * 0.95;
+}
+const gname = q.get('ground') || 'forest', gtex = TEX[gname] || TEX.forest;
+gtex.repeat.set(60 / (TEX_SCALE[gname] || 4), 60 / (TEX_SCALE[gname] || 4));
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshLambertMaterial({ map: gtex, color: gname === 'forest' ? 0x9a9a8a : 0xd0d0c8 }));
+ground.rotation.x = -Math.PI / 2; scene.add(ground);
+
+// models
+const t0 = performance.now();
+pickupMaterial();
+const shown = [];
+const one = q.get('type') || q.get('item');
+const place = (kind, isItem, x, z, yaw) => {
+  let m;
+  if (isItem) {
+    m = buildItemModel(kind);
+    const b = new THREE.Box3().setFromObject(m);
+    m.position.y = -b.min.y;      // rest it on the ground as it comes
+  } else m = buildPickupModel(kind, { sup: q.get('sup') === '1' });
+  m.position.x = x; m.position.z = z; m.rotation.y = yaw;
+  scene.add(m); shown.push({ kind: (isItem ? 'item:' : '') + kind, m });
+};
+if (one) place(one, !!q.get('item'), 0, 0, +(q.get('ryaw') || 0.5));
+else {
+  // ?types=ammo,medkit,item:frag  a chosen set side by side (closer spacing), else everything
+  const pick = q.get('types');
+  const list = pick ? pick.split(',').map((k) => (k.startsWith('item:') ? [k.slice(5), true] : [k, false]))
+    : [...PICKUP_TYPES.map((k) => [k, false]), ...ITEM_KINDS.map((k) => [k, true])];
+  const cols = pick ? +(q.get('cols') || Math.min(4, list.length)) : 6, sx = pick ? +(q.get('gap') ?? 0.5) : 1.1, sz = pick ? sx : 1.0;
+  const rows = Math.ceil(list.length / cols);
+  list.forEach(([k, it], i) => { const c = i % cols, r = Math.floor(i / cols); place(k, it, (c - (cols - 1) / 2) * sx, (r - (rows - 1) / 2) * sz, pick ? +(q.get('ryaw') || 0.3) : 0.4 + (i % 3) * 0.3); });
+}
+const buildMs = Math.round(performance.now() - t0);
+
+// glints: the same pulse level.js runs
+const glintAt = (time) => { shown.forEach((s, i) => { const gl = s.m.userData.glow; if (gl) { gl.material.opacity = 0.45 + Math.sin(time * 3 + i) * 0.3; gl.visible = q.get('glint') !== '0'; } }); };
+glintAt(+(q.get('t') ?? 0.52));
+
+// camera
+const box = new THREE.Box3(); for (const s of shown) box.expandByObject(s.m);
+const ctr = box.getCenter(new THREE.Vector3());
+const cam = new THREE.PerspectiveCamera(+(q.get('fov') || 75), innerWidth / innerHeight, 0.02, 200);
+const view = q.get('cam') || (one ? 'stand' : 'grid');
+let yaw = +(q.get('yaw') || 0), pitch, dist;
+if (view === 'stand') { const h = +(q.get('h') || 1.62), d = +(q.get('dist') || 1.5); pitch = Math.atan2(h - ctr.y, d); dist = Math.hypot(h - ctr.y, d); }
+else if (view === 'close') { pitch = 0.6; dist = +(q.get('dist') || 0.3); if (!q.get('fov')) cam.fov = 55; }
+else if (view === 'far') { const d = +(q.get('dist') || 8); pitch = Math.atan2(1.62, d); dist = Math.hypot(1.62, d); }
+else if (view === 'top') { pitch = 1.5; dist = +(q.get('dist') || 1.2); }
+else if (view === 'grid') { pitch = 0.95; dist = +(q.get('dist') || 6.5); if (!q.get('fov')) cam.fov = 50; }
+else { pitch = +(q.get('pitch') || 0.6); dist = +(q.get('dist') || 1.5); }
+if (q.get('pitch')) pitch = +q.get('pitch');
+cam.updateProjectionMatrix();
+const labels = document.getElementById('labels');
+function frame() {
+  cam.position.set(ctr.x + Math.sin(yaw) * Math.cos(pitch) * dist, ctr.y + Math.sin(pitch) * dist, ctr.z + Math.cos(yaw) * Math.cos(pitch) * dist);
+  cam.lookAt(ctr);
+  renderer.render(scene, cam);
+  labels.innerHTML = '';
+  if (!one) for (const s of shown) {
+    const p = s.m.position.clone(); p.y -= 0.02; p.project(cam);
+    if (p.z > 1) continue;
+    const d = document.createElement('div'); d.textContent = s.kind;
+    d.style.left = ((p.x + 1) / 2 * innerWidth) + 'px'; d.style.top = ((1 - p.y) / 2 * innerHeight + 6) + 'px';
+    labels.appendChild(d);
+  }
+}
+frame();
+const ri = renderer.info.render;
+let tris = 0, calls = 0;
+for (const s of shown) s.m.traverse((o) => { if (o.isMesh) { calls++; tris += o.geometry.index.count / 3; } else if (o.isSprite) calls++; });
+const stats = Object.entries(STATS).map(([k, v]) => `${k.padEnd(16)} ${String(v.tris).padStart(5)} tris  ${String(v.ms).padStart(3)} ms`).join('\n');
+document.getElementById('info').textContent = `${one || 'all'}  env ${q.get('env') || 'forest'}  view ${view}  draws ${ri.calls}  scene tris ${ri.triangles}  pickup draws ${calls}  pickup tris ${tris}\nbuilt in ${buildMs} ms\n` + (one ? stats : '');
+window.__viewer = { ready: true, buildMs, stats: STATS, calls: ri.calls, tris: ri.triangles };
+
+// on demand: orbit, zoom, resize, optional glint pulse
+let drag = null;
+addEventListener('pointerdown', (e) => { drag = [e.clientX, e.clientY]; });
+addEventListener('pointerup', () => { drag = null; });
+addEventListener('pointermove', (e) => { if (!drag) return; yaw -= (e.clientX - drag[0]) * 0.008; pitch = Math.max(0.02, Math.min(1.55, pitch + (e.clientY - drag[1]) * 0.008)); drag = [e.clientX, e.clientY]; frame(); });
+addEventListener('wheel', (e) => { dist *= Math.exp(e.deltaY * 0.001); frame(); }, { passive: true });
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix(); frame(); });
+if (q.get('anim') === '1') { const loop = (t) => { glintAt(t / 1000); frame(); requestAnimationFrame(loop); }; requestAnimationFrame(loop); }
+const L = document.getElementById('links');
+for (const [k, v] of [['cam', 'stand'], ['cam', 'close'], ['cam', 'far'], ['env', 'forest'], ['env', 'dawnEnd'], ['envmap', '1']]) {
+  const a = document.createElement('a'); const p = new URLSearchParams(q); p.set(k, v); a.href = '?' + p; a.textContent = `${k}=${v}`; L.appendChild(a);
+}
+</script>
+</body>
+</html>

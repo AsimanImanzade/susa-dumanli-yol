@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="az">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Şuşa: Dumanlı Yol</title>
+    <meta name="description" content="A first-person stealth-action shooter: cross the fog-bound forest, climb the cliffs and clear the streets of Shusha." />
+    <meta property="og:title" content="Şuşa: Dumanlı Yol" />
+    <meta property="og:description" content="First-person stealth-action shooter. Cross the foggy forest, climb the cliffs, clear the streets sector by sector and raise the flag." />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23161b1e'/%3E%3Cpath d='M5 24 L13 10 L18 17 L22 12 L27 24 Z' fill='%238f8f88'/%3E%3Ccircle cx='23' cy='8' r='3' fill='%23ffb648'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="style.css" />
+    <script type="importmap">{ "imports": { "three": "./vendor/three.module.js" } }</script>
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+    <canvas id="hudc" class="hidden"></canvas>
+    <div id="hud" class="hidden"></div>
+    <div id="fade"></div>
+    <div id="ui"></div>
+    <div id="boot">Yüklənir…</div>
+    <script type="module" src="client.js"></script>
+  </body>
+</html>

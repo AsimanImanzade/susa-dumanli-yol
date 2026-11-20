@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Soldier viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 12px/1.35 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 8px; top: 8px; max-width: 600px; background: rgba(10, 12, 14, 0.72); padding: 6px 8px; border-radius: 4px; }
+  #ui .row { margin: 2px 0; }
+  #ui button { font: inherit; background: #2a2f33; color: #ddd; border: 1px solid #444; border-radius: 3px; padding: 1px 6px; margin: 1px; cursor: pointer; }
+  #ui button.on { background: #5b6a46; border-color: #8a9a6a; color: #fff; }
+  #info { white-space: pre; font-family: ui-monospace, Menlo, monospace; font-size: 11px; margin-top: 4px; }
+  #ui.hide .row, #ui.hide #info { display: none; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="ui"><div id="rows"></div><div id="info"></div></div>
+<script type="module">
+/**
+ * Soldier viewer and locomotion test bench.
+ *
+ *   ?pose=idle|walk|search|run|…   the classic poses (walk/search/run move the mesh along +Z unless move=0)
+ *   ?mode=tread    treadmill: walks in place at v= m/s in direction dir= (deg: 0 ahead, 90 right, 180 back)
+ *   ?mode=free     the mesh really travels (same v / dir), wrapping round
+ *   ?mode=fig8     a figure of eight round two pillars, steered by the real ai._move (state=patrol|search|combat)
+ *   ?mode=startstop  accelerate, cruise, brake, stand (locomotion.js speed curve), repeat
+ *   ?mode=turn     turns on the spot by ±90° and 180° (AI turn rates)
+ *   aim=1  slow=0.25  pause=1  cam=side|front|top|follow|…
+ * window.__viewer: step(dt), render(), strip(n, opts) draws n frames of one gait cycle in one image,
+ * slide() foot drift per stance, cost(n) rig.update µs, cadence().
+ */
+import * as THREE from 'three';
+import { buildSoldier, soldierStats, SOLDIER_VARIANTS } from '../js/soldier-model.js';
+import { ENV } from '../js/render.js';
+import { G } from '../js/ctx.js';
+import { AI } from '../js/config.js';
+import { World } from '../js/physics.js';
+import { NavGrid } from '../js/nav.js';
+import { moveLimits, approachSpeed, paceFor } from '../js/locomotion.js';
+
+const q = new URLSearchParams(location.search);
+const S = {
+  kind: q.get('kind') || 'rifle', variant: +(q.get('variant') || 0), pose: q.get('pose') || 'idle', cam: q.get('cam') || 'three',
+  env: q.get('env') || 'forest', pitch: +(q.get('pitch') || 0), t: q.has('t') ? +q.get('t') : null, ui: q.get('ui') !== '0', move: q.get('move') !== '0',
+  mode: q.get('mode') || 'pose', v: q.has('v') ? +q.get('v') : 1.5, dir: +(q.get('dir') || 0), aim: q.get('aim') === '1', slow: +(q.get('slow') || 1),
+  pause: q.get('pause') === '1', state: q.get('state') || 'patrol', marks: q.get('marks') !== '0',
+};
+const BENCH = S.mode !== 'pose';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.LinearToneMapping;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 300);
+scene.fog = new THREE.FogExp2(0x121a20, 0.03);
+const hemi = new THREE.HemisphereLight(0x8090a0, 0x2a2a26, 1); scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.8); scene.add(sun, sun.target);
+const lamp = new THREE.PointLight(0xffc98a, 0, 14, 1.4); scene.add(lamp);
+
+// ground with a 1 m grid texture so foot sliding is visible
+const gc = document.createElement('canvas'); gc.width = gc.height = 256;
+const g2 = gc.getContext('2d'); g2.fillStyle = '#5a5850'; g2.fillRect(0, 0, 256, 256);
+for (let i = 0; i < 2000; i++) { g2.fillStyle = `rgba(${Math.random() < 0.5 ? '0,0,0' : '255,255,255'},${Math.random() * 0.06})`; g2.fillRect(Math.random() * 256, Math.random() * 256, 3, 3); }
+g2.strokeStyle = 'rgba(0,0,0,0.25)'; g2.lineWidth = 2; g2.strokeRect(0, 0, 256, 256);
+g2.strokeStyle = 'rgba(0,0,0,0.12)'; g2.lineWidth = 1; for (let i = 1; i < 4; i++) { g2.beginPath(); g2.moveTo(i * 64, 0); g2.lineTo(i * 64, 256); g2.moveTo(0, i * 64); g2.lineTo(256, i * 64); g2.stroke(); }
+const gt = new THREE.CanvasTexture(gc); gt.wrapS = gt.wrapT = THREE.RepeatWrapping; gt.repeat.set(600, 600); gt.colorSpace = THREE.SRGBColorSpace; gt.anisotropy = 8;
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.MeshLambertMaterial({ map: gt }));
+ground.rotation.x = -Math.PI / 2; scene.add(ground);
+// a few dark backdrop posts (to judge readability against dark shapes)
+for (let i = 0; i < 14; i++) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.35, 9, 8), new THREE.MeshLambertMaterial({ color: 0x2c3328 }));
+  m.position.set((i % 7 - 3) * 4.5 + 1.3, 4.5, -18 - Math.floor(i / 7) * 9); scene.add(m);
+}
+
+function setEnv(name) {
+  if (name === 'studio') {
+    scene.fog.color.set(0x3a3e42); scene.fog.density = 0.004; renderer.setClearColor(0x3a3e42);
+    hemi.color.set(0xb8c0c8); hemi.groundColor.set(0x504c44); hemi.intensity = 1.6; sun.color.set(0xfff2e0); sun.intensity = 2.0; sun.position.set(3, 6, -4);
+    renderer.toneMappingExposure = 1.0; lamp.intensity = 0; return;
+  }
+  const A = ENV[name] || ENV.forest;
+  scene.fog.color.set(A.fog); scene.fog.density = A.fogDensity; renderer.setClearColor(A.fog);
+  hemi.color.set(A.ambient); hemi.groundColor.copy(hemi.color).multiplyScalar(0.45); hemi.intensity = A.ambientI * 1.6;
+  sun.color.set(A.sun); sun.intensity = A.sunI * 1.8;
+  sun.position.set(A.sunDir[0] * 50, A.sunDir[1] * 50, A.sunDir[2] * 50);
+  renderer.toneMappingExposure = A.exposure;
+  lamp.intensity = name === 'streets' ? 26 * 0.6 : 0; lamp.position.set(-3, 4, -2);
+}
+setEnv(S.env);
+
+// ── soldiers
+let actors = [];
+function clear() { for (const a of actors) { scene.remove(a.mesh); a.mesh.skeleton.dispose(); } actors = []; }
+function spawn(kind, variant, x, z, yaw, pose) {
+  const { mesh, rig } = buildSoldier(kind, { variant, seed: variant });
+  mesh.position.set(x, 0, z); mesh.rotation.y = yaw;
+  scene.add(mesh);
+  const a = { mesh, rig, kind, variant, pose, x, z, yaw, t: 0, shotT: 0, z0: z, x0: x };
+  // probe for the headLocal check: an Object3D at the head centre, child of the head bone
+  a.probe = new THREE.Object3D(); a.probe.position.copy(rig.hc); rig.b.head.add(a.probe);
+  applyPose(a, true);
+  actors.push(a);
+  return a;
+}
+const DEATHS = { death0: 0, death1: 1, death2: 2, deathb: 0, deathf: 1, deathc: 2 };
+const SPEED = { walk: 1.5, search: 2.5, run: 4.4, runaim: 4.4, sprint: 6.5 };
+function applyPose(a, first) {
+  const r = a.rig, p = a.pose;
+  r.setStun(p === 'stun'); r.setCrouch(p === 'crouch' || p === 'kneelaim');
+  r.setAim(['aim', 'shoot', 'kneelaim', 'search', 'runaim'].includes(p) || (BENCH && S.aim), S.pitch);
+  r.setMove(SPEED[p] || 0);
+  if (first && p in DEATHS) { a.deathAt = 0.6; }
+}
+function layout() {
+  clear();
+  if (S.cam === 'row') {
+    const kinds = ['rifle', 'rifle', 'rifle', 'officer', 'sniper', 'friendly', 'friendly'];
+    for (const [d, n] of [[5, 7], [15, 7], [40, 7]]) for (let i = 0; i < n; i++) {
+      const k = kinds[i], v = k === 'rifle' ? i : k === 'friendly' ? i - 5 : 0;
+      const a = spawn(k, v, (i - (n - 1) / 2) * (d < 10 ? 1.2 : d < 20 ? 2.2 : 4), -d, Math.PI * (i % 2 ? 0.9 : 1.15), i % 3 === 1 ? 'aim' : i % 3 === 2 ? 'walk' : 'idle');
+      a.noMove = true; a.rig.treadmill = true;
+    }
+  } else if (S.cam === 'squad') {
+    for (let i = 0; i < 6; i++) { const a = spawn(i < 4 ? 'rifle' : i === 4 ? 'officer' : 'sniper', i, (i - 2.5) * 1.1, -3.5 - (i % 2) * 0.8, Math.PI + (i - 2.5) * 0.15, S.pose); a.noMove = true; a.rig.treadmill = true; }
+  } else {
+    const a = spawn(S.kind, S.variant, 0, 0, Math.PI, BENCH ? 'idle' : S.pose);
+    if (!S.move && !BENCH) a.rig.treadmill = true;
+    if (S.mode === 'tread') a.rig.treadmill = true;
+  }
+}
+layout();
+
+// ── bench: the scripted motion of actor 0
+const B = { t: 0, speed: 0, yawT: Math.PI, turnI: 0, ss: 'go', ssT: 0, e: null, path: [], laps: 0 };
+const lim = moveLimits(S.state === 'combat' ? AI.runSpeed : S.v, AI.loco, {});
+let aiMod = null, navWorld = null;
+async function setupFig8() {
+  // a real nav grid round two pillars, and a stand-in enemy steered by the real ai._move
+  navWorld = new World({ minX: -20, maxX: 20, minZ: -20, maxZ: 20 }, () => 0);
+  for (const cx of [-3.2, 3.2]) {
+    navWorld.addBox({ x: cx, y: 1.5, z: 0, hx: 0.5, hy: 1.5, hz: 0.5 });
+    const m = new THREE.Mesh(new THREE.BoxGeometry(1, 3, 1), new THREE.MeshLambertMaterial({ color: 0x6d675c })); m.position.set(cx, 1.5, 0); scene.add(m);
+  }
+  G.world = navWorld; G.nav = new NavGrid(navWorld); G.level = { noWalkFns: [] }; G.player = { y: 0 }; G.simTime = 0;
+  aiMod = await import('../js/ai.js');
+  const a = actors[0];
+  const st = S.state === 'search' ? 'searching' : S.state === 'combat' ? 'combat' : 'patrol';
+  const e = B.e = { id: 1, state: st, fixed: false, alive: true, path: [], pi: 0, x: 0, z: 2.6, y: 0, yaw: Math.PI / 2, lookYaw: null, seen: false, lastSeenT: -100, dist: 99,
+    rig: a.rig, moving: false, stuckT: 0, stuckX: 0, stuckZ: 0, stuckN: 0, prevYaw: Math.PI / 2, goalX: 0, goalZ: 0, pace: 1 };
+  e.loco = { x: e.x, z: e.z, spd: 0, hd: e.yaw, sx: e.x, sz: e.z, pi: 0, face: e.yaw, faceFollows: true };
+  G.enemies = [e];
+  // figure of eight: two loops round the pillars, crossing at the origin
+  for (let i = 0; i <= 24; i++) {
+    const th = i / 24 * Math.PI * 2, r = 3.2;
+    B.path.push({ x: Math.sin(th) * r * 1.35, z: Math.sin(th) * Math.cos(th) * r * 1.2 + (i === 0 || i === 24 ? 0 : 0) });
+  }
+  const pts = B.path.map((p) => new THREE.Vector3(p.x, 0.02, p.z));
+  scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xd8c060 })));
+  e.x = B.path[0].x; e.z = B.path[0].z + 0.3; e.loco.x = e.x; e.loco.z = e.z;
+  restartFig8();
+}
+function restartFig8() { const e = B.e; e.path = B.path.map((p) => ({ x: p.x, z: p.z })); e.pi = 0; e.loco.sx = e.x; e.loco.sz = e.z; B.laps++; }
+if (S.mode === 'fig8') await setupFig8();
+
+function benchStep(a, dt) {
+  const r = a.rig;
+  B.t += dt;
+  const rad = S.dir * Math.PI / 180;
+  if (S.mode === 'tread' || S.mode === 'free') {
+    // facing yaw π (towards +Z); travel at `dir` from the facing
+    const lx = Math.sin(rad) * S.v, lz = -Math.cos(rad) * S.v;
+    r.setMove(S.v, lx, lz, 0);
+    if (S.mode === 'free') {
+      const c = Math.cos(a.yaw), s = Math.sin(a.yaw);
+      a.x += (lx * c + lz * s) * dt; a.z += (-lx * s + lz * c) * dt;
+      if (Math.hypot(a.x, a.z) > 40) { a.x = 0; a.z = 0; B.wrapped = true; }
+      a.mesh.position.set(a.x, 0, a.z);
+    }
+  } else if (S.mode === 'startstop') {
+    B.ssT += dt;
+    if (B.ss === 'go' && B.ssT > 3) { B.ss = 'stop'; B.ssT = 0; }
+    else if (B.ss === 'stop' && B.ssT > 2.5) { B.ss = 'go'; B.ssT = 0; }
+    B.speed = approachSpeed(B.speed, B.ss === 'go' ? S.v : 0, lim, dt);
+    const lx = Math.sin(rad) * B.speed, lz = -Math.cos(rad) * B.speed, c = Math.cos(a.yaw), s = Math.sin(a.yaw);
+    a.x += (lx * c + lz * s) * dt; a.z += (-lx * s + lz * c) * dt;
+    if (Math.hypot(a.x, a.z) > 40) { a.x = 0; a.z = 0; B.wrapped = true; }
+    a.mesh.position.set(a.x, 0, a.z);
+    r.setMove(B.speed, lx, lz, 0);
+  } else if (S.mode === 'turn') {
+    // like an enemy turning to look: dampAngle at the AI's turn rate
+    if (B.t > 2.2) { B.t = 0; B.turnI++; const steps = [Math.PI / 2, Math.PI / 2, -Math.PI, Math.PI / 4, -Math.PI / 2]; B.yawT += steps[B.turnI % steps.length]; }
+    const rate = AI.turnRate * (S.aim ? 1.4 : 0.7), py = a.yaw;
+    a.yaw += (B.yawT - a.yaw) * (1 - Math.exp(-rate * dt));
+    a.mesh.rotation.y = a.yaw;
+    r.setMove(0, 0, 0, dt > 0 ? (a.yaw - py) / dt : 0);
+  } else if (S.mode === 'fig8' && B.e) {
+    const e = B.e;
+    G.simTime += dt;
+    if (S.aim && e.state !== 'patrol') { e.dist = 20; }
+    aiMod.ai._move(e, dt);
+    if (e.pi >= e.path.length) restartFig8();
+    a.x = e.x; a.z = e.z; a.yaw = e.yaw;
+    a.mesh.position.set(e.x, 0, e.z); a.mesh.rotation.y = e.yaw;
+  }
+}
+
+// ── foot contact markers and the foot-slide measurement (from the real bone matrices)
+const markGeo = new THREE.CircleGeometry(0.035, 12); markGeo.rotateX(-Math.PI / 2);
+const markMat = [new THREE.MeshBasicMaterial({ color: 0x3fa0ff }), new THREE.MeshBasicMaterial({ color: 0xff6040 })];
+const marks = [];
+for (let i = 0; i < 24; i++) { const m = new THREE.Mesh(markGeo, markMat[i % 2]); m.visible = false; scene.add(m); marks.push(m); }
+let markI = 0;
+const FT = { heel: new THREE.Vector3(), ball: new THREE.Vector3() };
+const slide = { feet: [{ st: false }, { st: false }], log: [], vlog: [], steps: [], lastLand: [null, null] };
+const _fi = {}, _hp = new THREE.Vector3(), _bp = new THREE.Vector3();
+function groundPoint(a, v) {
+  // world → the rig's ground frame (the treadmill belt moves under him)
+  if (a.rig.treadmill) { v.x += a.rig.bx - a.mesh.position.x; v.z += a.rig.bz - a.mesh.position.z; }
+  return v;
+}
+function measure(a) {
+  const r = a.rig, k = r.k;
+  a.mesh.updateMatrixWorld(true);
+  if (B.wrapped) { B.wrapped = false; slide.feet[0].st = slide.feet[1].st = false; slide.lastLand[0] = slide.lastLand[1] = null; return; }
+  for (let si = 0; si < 2; si++) {
+    const bone = si ? r.b.footR : r.b.footL, f = slide.feet[si];
+    r.footInfo(si, _fi);
+    _hp.set(0, -0.085 * k, 0.055 * k).applyMatrix4(bone.matrixWorld); groundPoint(a, _hp);
+    _bp.set(0, -0.085 * k, -0.13 * k).applyMatrix4(bone.matrixWorld); groundPoint(a, _bp);
+    if (_fi.planted && !f.st) {
+      // a new stance: remember where the heel touched; the ball is pinned once the foot is flat
+      f.st = true; f.h0 = null; f.b0 = null; f.max = 0; f.vmax = 0; f.t0 = performance.now();
+      const pl = slide.lastLand[si]; slide.lastLand[si] = { x: _fi.x, z: _fi.z, t: B.t };
+      if (pl) slide.steps.push({ len: Math.hypot(_fi.x - pl.x, _fi.z - pl.z), dt: B.t - pl.t });
+      if (slide.steps.length > 30) slide.steps.shift();
+      if (S.marks) { const m = marks[markI++ % marks.length]; m.visible = true; m.material = markMat[si]; m.position.set(_fi.x, 0.004, _fi.z); m.userData.g = { x: _fi.x, z: _fi.z }; }
+    }
+    if (!_fi.planted && f.st) { f.st = false; slide.log.push(f.max); slide.vlog.push(f.vmax); if (slide.log.length > 40) { slide.log.shift(); slide.vlog.shift(); } }
+    if (f.st) {
+      if (_fi.pitch > -0.01) { if (!f.h0) f.h0 = _hp.clone(); f.max = Math.max(f.max, Math.hypot(_hp.x - f.h0.x, _hp.z - f.h0.z)); }
+      if (_fi.pitch < 0.01) { if (!f.b0) f.b0 = _bp.clone(); f.max = Math.max(f.max, Math.hypot(_bp.x - f.b0.x, _bp.z - f.b0.z)); }
+      // floating / sinking: the lowest of heel and ball against the ground
+      f.vmax = Math.max(f.vmax, Math.abs(Math.min(_hp.y, _bp.y)));
+    }
+  }
+  // markers ride the treadmill belt
+  if (r.treadmill) for (const m of marks) if (m.visible && m.userData.g) m.position.set(m.userData.g.x - r.bx + a.mesh.position.x, 0.004, m.userData.g.z - r.bz + a.mesh.position.z);
+  if (r.treadmill) gt.offset.set((r.bx - a.mesh.position.x) / 1, -(r.bz - a.mesh.position.z) / 1);
+}
+function slideStats() {
+  const L = slide.log.slice(2), V = slide.vlog.slice(2), st = slide.steps.slice(2);
+  const mean = (x) => x.length ? x.reduce((s, v) => s + v, 0) / x.length : 0;
+  const stepT = mean(st.map((s) => s.dt));
+  return { stances: L.length, meanCm: +(mean(L) * 100).toFixed(2), maxCm: +(Math.max(0, ...L) * 100).toFixed(2), floatCm: +(Math.max(0, ...V) * 100).toFixed(2),
+    strideM: +mean(st.map((s) => s.len)).toFixed(3), stepsPerMin: stepT ? +(60 / stepT * 2).toFixed(1) : 0 };
+}
+
+// ── camera
+const target = new THREE.Vector3(0, 1.0, 0);
+let orbit = { yaw: 0.7, pitch: 0.12, dist: 3.4 };
+const CAMS = {
+  front: { yaw: 0, pitch: 0.08, dist: 3.2, ty: 0.95 }, side: { yaw: Math.PI / 2, pitch: 0.06, dist: 3.2, ty: 0.95 }, back: { yaw: Math.PI, pitch: 0.1, dist: 3.2, ty: 0.95 },
+  three: { yaw: 0.65, pitch: 0.12, dist: 3.3, ty: 0.95 }, head: { yaw: 0.45, pitch: 0.05, dist: 0.75, ty: 1.6 }, hands: { yaw: 0.9, pitch: 0.25, dist: 1.25, ty: 1.2 },
+  feet: { yaw: 1.2, pitch: 0.15, dist: 1.6, ty: 0.3 }, top: { yaw: 0.0001, pitch: 1.5, dist: 5.5, ty: 0.2 }, left: { yaw: -Math.PI / 2, pitch: 0.06, dist: 3.2, ty: 0.95 },
+  follow: { yaw: 0.9, pitch: 0.35, dist: 5.5, ty: 0.8 }, fig8: { yaw: 0.0001, pitch: 1.1, dist: 14, ty: 0 },
+  row: { yaw: 0, pitch: 0.02, dist: 0.01, ty: 1.6 }, squad: { yaw: 0, pitch: 0.05, dist: 0.01, ty: 1.55 }, far: { yaw: 0.3, pitch: 0.04, dist: 12, ty: 1.0 }, far40: { yaw: 0.3, pitch: 0.02, dist: 40, ty: 1.0 },
+};
+function setCam(name) {
+  const c = CAMS[name] || CAMS.three; orbit = { yaw: c.yaw, pitch: c.pitch, dist: c.dist }; target.y = c.ty;
+  if (q.has('cy')) orbit.yaw = +q.get('cy'); if (q.has('cp')) orbit.pitch = +q.get('cp'); if (q.has('cd')) orbit.dist = +q.get('cd'); if (q.has('ct')) target.y = +q.get('ct');
+}
+setCam(S.cam);
+let drag = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY }; });
+addEventListener('pointerup', () => { drag = null; });
+addEventListener('pointermove', (e) => { if (!drag) return; orbit.yaw -= (e.clientX - drag.x) * 0.008; orbit.pitch = Math.max(-0.4, Math.min(1.55, orbit.pitch + (e.clientY - drag.y) * 0.006)); drag = { x: e.clientX, y: e.clientY }; });
+addEventListener('wheel', (e) => { orbit.dist = Math.max(0.3, Math.min(60, orbit.dist * (e.deltaY > 0 ? 1.1 : 0.9))); });
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+// ── UI
+function urlWith(k, v) { const u = new URLSearchParams(location.search); u.set(k, v); return '?' + u.toString(); }
+const rows = document.getElementById('rows');
+const OPTS = {
+  kind: Object.keys(SOLDIER_VARIANTS), variant: [0, 1, 2],
+  pose: ['idle', 'walk', 'search', 'run', 'runaim', 'sprint', 'aim', 'shoot', 'crouch', 'kneelaim', 'stun', 'hit', 'death0', 'death1', 'death2'],
+  mode: ['pose', 'tread', 'free', 'fig8', 'startstop', 'turn'], v: [0.8, 1.4, 1.9, 2.5, 3.4, 4.4], dir: [0, 45, 90, 135, 180, -90],
+  cam: ['front', 'three', 'side', 'left', 'back', 'head', 'hands', 'feet', 'top', 'follow', 'fig8', 'far', 'row', 'squad'],
+  env: ['forest', 'streets', 'studio'], pitch: [-0.5, 0, 0.6], slow: [1, 0.25, 0.1],
+};
+for (const [k, list] of Object.entries(OPTS)) {
+  const r = document.createElement('div'); r.className = 'row'; r.textContent = k + ': ';
+  for (const v of list) { const b = document.createElement('button'); b.textContent = v; if (String(S[k]) === String(v)) b.className = 'on'; b.onclick = () => { location.search = urlWith(k, v); }; r.appendChild(b); }
+  rows.appendChild(r);
+}
+if (!S.ui) document.getElementById('ui').classList.add('hide');
+const info = document.getElementById('info');
+const st = {};
+for (const k of Object.keys(SOLDIER_VARIANTS)) for (let v = 0; v < SOLDIER_VARIANTS[k]; v++) st[k + v] = soldierStats(k, v);
+const statLine = Object.entries(st).map(([k, s]) => `${k}:${s.tris}`).join(' ');
+
+// ── headLocal check (FK result vs the real bone after a forced matrix update)
+const _hl = { x: 0, y: 0, z: 0 }, _w = new THREE.Vector3(), _l = new THREE.Vector3();
+function headErr(a) {
+  a.mesh.updateMatrixWorld(true);
+  a.probe.getWorldPosition(_w);
+  a.rig.headLocal(_hl);
+  _l.set(_hl.x, _hl.y, _hl.z);
+  a.mesh.localToWorld(_l);
+  return _w.distanceTo(_l);
+}
+let maxErr = 0;
+const clock = new THREE.Clock();
+let simT = 0;
+function step(dt) {
+  simT += dt;
+  for (const a of actors) {
+    a.t += dt;
+    const r = a.rig;
+    const p = a.pose;
+    if (BENCH && a === actors[0]) benchStep(a, dt);
+    else if (!a.noMove && S.move && p in SPEED) {
+      a.z += SPEED[p] * dt;            // facing +Z (yaw π)
+      if (a.z > 14) a.z = -14;
+      a.mesh.position.z = a.z;
+    }
+    if (p === 'shoot') { a.shotT -= dt; if (a.shotT <= 0) { r.shoot(); a.shotT = a.t % 2 < 1.2 ? 0.11 : 0.6; } }
+    if (p === 'hit' && a.t % 1.4 < dt) r.hit();
+    if (p in DEATHS && a.deathAt !== undefined && a.t >= a.deathAt && !r.dead) r.die(DEATHS[p] === 1 ? -1 : 1, DEATHS[p]);
+    if (p in DEATHS && a.t > 3.6) {   // replay
+      const i = actors.indexOf(a); scene.remove(a.mesh); a.mesh.skeleton.dispose();
+      const n = spawn(a.kind, a.variant, a.x0, a.z0, a.yaw, p); actors.splice(actors.length - 1, 1); actors[i] = n;
+      continue;
+    }
+    r.update(dt);
+    maxErr = Math.max(maxErr, headErr(a));
+    if (a === actors[0]) measure(a);
+  }
+}
+function placeCamera() {
+  const a0 = actors[0];
+  if (S.cam !== 'row' && S.cam !== 'squad' && a0 && S.cam !== 'fig8') { target.x = a0.mesh.position.x; target.z = a0.mesh.position.z; }
+  if (S.cam === 'row' || S.cam === 'squad') { camera.position.set(0, S.cam === 'row' ? 1.62 : 1.55, S.cam === 'row' ? 0 : 1.2); camera.lookAt(0, S.cam === 'row' ? 1.3 : 1.1, -20); }
+  else {
+    const c = Math.cos(orbit.pitch);
+    // yaw 0 = in front of the soldier (he faces +Z here)
+    camera.position.set(target.x + Math.sin(orbit.yaw) * c * orbit.dist, target.y + Math.sin(orbit.pitch) * orbit.dist, target.z + Math.cos(orbit.yaw) * c * orbit.dist);
+    camera.lookAt(target);
+  }
+}
+function render() {
+  placeCamera();
+  renderer.setViewport(0, 0, innerWidth, innerHeight); renderer.setScissorTest(false);
+  renderer.render(scene, camera);
+}
+function frame() {
+  let dt = Math.min(0.05, clock.getDelta()) * S.slow;
+  if (S.t !== null || S.pause) dt = 0;
+  if (!stripOn) { step(dt); render(); }
+  const a0 = actors[0], r = a0 && a0.rig, hl = r ? r.headLocal({}) : null, ss = slideStats();
+  info.textContent = `tris ${statLine}\ncalls ${renderer.info.render.calls}  tris/frame ${renderer.info.render.triangles}\n` +
+    (r ? `head local ${hl.x.toFixed(3)} ${hl.y.toFixed(3)} ${hl.z.toFixed(3)}  max FK err ${(maxErr * 1000).toFixed(2)} mm  dead ${r.dead}\n` +
+      `speed ${r.spd.toFixed(2)} m/s  gait ${r.gait ? 'rhythm' : 'standing'}  phase ${r.ph.toFixed(2)}  ${ss.stepsPerMin} steps/min  stride ${ss.strideM} m\n` +
+      `foot drift per stance: mean ${ss.meanCm} cm  max ${ss.maxCm} cm  (n ${ss.stances})  float/sink ${ss.floatCm} cm` : '');
+  requestAnimationFrame(frame);
+}
+// pre-roll to a fixed time if t= is given (for stable screenshots)
+if (S.t !== null) { for (let i = 0; i < Math.round(S.t * 60); i++) step(1 / 60); }
+let stripOn = false;
+requestAnimationFrame(frame);
+
+/**
+ * Draw n frames of one gait cycle (left heel strike to the next), or of `secs`
+ * seconds when he is not walking, side by side in one image (cols × rows tiles).
+ */
+function strip(n = 8, o = {}) {
+  const a = actors[0], r = a.rig, cols = o.cols || 4, rowsN = o.rowsTotal || Math.ceil(n / cols), row0 = o.row0 || 0, dt = 1 / 240;
+  stripOn = true;
+  // warm up, then wait for the left foot to land (phase wrap) when in rhythm
+  for (let i = 0; i < (o.warm ?? 600); i++) step(dt);
+  const timed = !r.gait || o.secs;
+  if (!timed) { let guard = 0, last = r.ph; while (guard++ < 2000) { step(dt); if (r.ph < last - 0.5) break; last = r.ph; } }
+  const W = innerWidth, H = innerHeight, tw = Math.floor(W / cols), th = Math.floor(H / rowsN);
+  renderer.setScissorTest(true); renderer.autoClear = false;
+  if (!row0) { renderer.setScissor(0, 0, W, H); renderer.setViewport(0, 0, W, H); renderer.clear(); }
+  camera.aspect = tw / th; camera.updateProjectionMatrix();
+  const startPh = r.ph, secs = o.secs || 1;
+  let t = 0;
+  for (let i = 0; i < n; i++) {
+    if (i > 0) {
+      if (timed) { const goal = secs * i / n; while (t < goal) { step(dt); t += dt; } }
+      else { const goal = i / n; let guard = 0; while (guard++ < 4000) { const p = (r.ph - startPh + 1) % 1; if (p >= goal - 1e-4) break; step(dt); } }
+    }
+    placeCamera();
+    const x = (i % cols) * tw, y = H - (Math.floor(i / cols) + row0 + 1) * th;
+    renderer.setViewport(x, y, tw, th); renderer.setScissor(x, y, tw, th);
+    renderer.clear(); renderer.render(scene, camera);
+  }
+  renderer.autoClear = true; renderer.setScissorTest(false);
+  camera.aspect = W / H; camera.updateProjectionMatrix();
+  return { phase0: +startPh.toFixed(3), slide: slideStats() };
+}
+/** µs per rig.update for actor 0 (a fresh rig walking) */
+function cost(n = 2000) {
+  const a = actors[0], t0 = performance.now();
+  for (let i = 0; i < n; i++) a.rig.update(1 / 60);
+  return +((performance.now() - t0) / n * 1000).toFixed(1);
+}
+// hooks for automated checks
+window.__viewer = {
+  THREE, actors: () => actors, step, render, strip, cost, slide: slideStats, resetSlide() { slide.log.length = 0; slide.vlog.length = 0; slide.steps.length = 0; slide.feet[0].st = slide.feet[1].st = false; slide.lastLand[0] = slide.lastLand[1] = null; },
+  headErr, respawn(pose, kind = S.kind, variant = S.variant) { S.pose = pose; S.kind = kind; S.variant = variant; layout(); return actors[0]; },
+  setPose(p) { for (const a of actors) { a.pose = p; applyPose(a, true); a.t = 0; } }, maxErr: () => maxErr, resetErr() { maxErr = 0; },
+  bench: B, S, stopRaf() { stripOn = true; }, startRaf() { stripOn = false; },
+  /** Set a bench gait (no measuring) and draw its strip into band `row0` of `rowsTotal`. */
+  gaitStrip(mode, v, dir = 0, aim = false, o = {}) {
+    S.mode = mode; S.v = v; S.dir = dir; S.aim = aim; B.t = 0; B.speed = 0; B.ss = 'go'; B.ssT = 0; B.yawT = Math.PI; B.turnI = 0;
+    const a = this.respawn('idle', o.kind || S.kind, o.variant ?? S.variant); a.rig.treadmill = mode === 'tread'; a.rig.setAim(aim, 0); a.yaw = Math.PI; a.x = a.z = 0;
+    this.resetSlide();
+    return strip(o.n || 8, { cols: o.cols || 4, rowsTotal: o.rowsTotal || 4, row0: o.row0 || 0, secs: o.secs, warm: o.warm });
+  },
+  /** Run a bench mode for `secs` (after a warm-up) and report drift, cadence, stride and head height / range. */
+  run(mode, v, dir = 0, aim = false, secs = 15, kind = S.kind, variant = S.variant) {
+    S.mode = mode; S.v = v; S.dir = dir; S.aim = aim; B.t = 0; B.speed = 0; B.ss = 'go'; B.ssT = 0; B.yawT = Math.PI; B.turnI = 0;
+    const a = this.respawn('idle', kind, variant); a.rig.treadmill = mode === 'tread'; a.rig.setAim(aim, 0); a.yaw = Math.PI; a.x = a.z = 0;
+    for (let i = 0; i < 400; i++) step(1 / 60);
+    this.resetSlide();
+    const h = {}; let lo = 9, hi = -9, sum = 0, n = 0, zs = 0, hlo = 9, hhi = -9;
+    for (let i = 0; i < secs * 60; i++) {
+      step(1 / 60); a.rig.headLocal(h); lo = Math.min(lo, h.y); hi = Math.max(hi, h.y); sum += h.y; zs += h.z; n++;
+      const hy = a.rig.list[0].position.y; hlo = Math.min(hlo, hy); hhi = Math.max(hhi, hy);
+    }
+    return { mode, v, dir, aim, ...slideStats(), headY: +(sum / n).toFixed(3), headZ: +(zs / n).toFixed(3), headRange: +(hi - lo).toFixed(3), hipsRange: +(hhi - hlo).toFixed(3) };
+  },
+  /** lowest skinned vertex of the body (rifle excluded) for actor i */
+  lowest(i = 0) {
+    const a = actors[i], m = a.mesh, g = m.geometry, si = g.attributes.skinIndex, sw = g.attributes.skinWeight, v = new THREE.Vector3();
+    m.updateMatrixWorld(true); m.skeleton.update();
+    let lo = 9, hi = -9;
+    for (let k = 0; k < g.attributes.position.count; k++) {
+      if (si.getX(k) === 19 && sw.getX(k) > 0.5) continue;
+      m.getVertexPosition(k, v); if (v.y < lo) lo = v.y; if (v.y > hi) hi = v.y;
+    }
+    return { lo, hi };
+  },
+};
+</script>
+</body>
+</html>
