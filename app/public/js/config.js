@@ -342,6 +342,8 @@ export const DEFAULT_SETTINGS = {
   motionBlur: false,
   killCam: true,
   subtitles: true,
+  showFps: false,       // small frame counter in the top-right corner
+  hudPercent: false,    // health and armour as numbers on the HUD (hud.js reads it)
   binds: null,
 };
 

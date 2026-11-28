@@ -1,6 +1,6 @@
 # Şuşa: Dumanlı Yol (The Foggy Path)
 
-![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=flat-square&logo=javascript&logoColor=black) ![Three.js](https://img.shields.io/badge/Three.js-000000?style=flat-square&logo=threedotjs&logoColor=white) ![WebGL](https://img.shields.io/badge/WebGL-990000?style=flat-square&logo=webgl&logoColor=white) ![Web Audio](https://img.shields.io/badge/Web_Audio-4A4A55?style=flat-square) ![Node test](https://img.shields.io/badge/tests-86_passing-2E7D32?style=flat-square&logo=nodedotjs&logoColor=white)
+![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=flat-square&logo=javascript&logoColor=black) ![Three.js](https://img.shields.io/badge/Three.js-000000?style=flat-square&logo=threedotjs&logoColor=white) ![WebGL](https://img.shields.io/badge/WebGL-990000?style=flat-square&logo=webgl&logoColor=white) ![Web Audio](https://img.shields.io/badge/Web_Audio-4A4A55?style=flat-square) ![Node test](https://img.shields.io/badge/tests-99_passing-2E7D32?style=flat-square&logo=nodedotjs&logoColor=white)
 
 A first-person stealth-action shooter that runs in the browser. One campaign mission in four acts, written in plain JavaScript on Three.js with no game engine and no bundler.
 
@@ -12,12 +12,13 @@ The mission is a work of fiction inspired by the battle for Shusha in November 2
 
 | | |
 |---|---|
-| Code | About 21,800 lines across 43 ES modules and 4 act files |
-| Mission | 4 acts, each with its own sectors, patrols, checkpoints and objectives |
+| Code | About 26,200 lines across 47 ES modules and 4 act files |
+| Mission | 4 acts, each with its own sectors, patrols, checkpoints, a main objective and optional ones |
+| Interface | A live 3D menu backdrop of the Şuşa fortress, menus that work by keyboard, a circular health HUD, compass and map with objective markers |
 | Enemy AI | State machine (patrol, suspicious, searching, combat, stunned) with sight, hearing, radio check-ins and squad call-outs |
-| Simulation | Hitscan and projectile ballistics, wood penetration, suppressor wear, bleeding and armour, a tank and artillery, enterable houses with doors |
+| Simulation | Hitscan and projectile ballistics, wood penetration, suppressor wear, bleeding and armour, a tank and artillery, enterable and furnished houses with doors |
 | Art and sound | Every model, texture, sound effect and music layer is generated in code. No downloaded art |
-| Tests | 86 unit tests on the pure rules, all passing |
+| Tests | 99 unit tests on the pure rules, all passing |
 
 ## How it works
 
@@ -37,15 +38,19 @@ where visibility = stance × movement × light × foliage. Fog and darkness shor
 
 **Vehicles.** A tank patrols the market square as a moving solid: its crew see with the soldiers' detection model through the driver's and the gunner's arcs, its engine masks your footsteps, and it shells your hiding place if you go to ground after being seen. C4 rides the moving hull, and only a charge on the engine deck, rear plate or fuel drums destroys it. The rules are in `vehicle-rules.js`.
 
-**Houses.** Two- and three-storey townhouses have stairs, furniture, dark and lit rooms, and hinged doors that creak, block sight and are saved with checkpoints. The floor plans and door rules are in `interior-rules.js`.
+**Houses.** Two- and three-storey townhouses have stairs, dark and lit rooms, and hinged doors that creak, block sight and are saved with checkpoints. Their rooms are furnished as homes left in a hurry: kitchens with a sink run, stove, fridge and a samovar with armudu tea glasses, bedrooms with beds, wardrobes and dressers, living rooms with a sofa, sideboard and an old television, Qarabağ carpets on floors and walls, curtains and ceiling lamps. Furniture is placed in a second planning pass with its own random stream, so the spots the acts use for loot and sentries never move. The floor plans, placement and door rules are in `interior-rules.js` and are unit-tested.
 
-**Rendering.** PBR textures with normal and roughness maps drawn on canvases at start-up, automatic quality with dynamic resolution, MSAA and stable shadows, AgX tone mapping and sky-based lighting. Sounds and the three music layers are synthesised with Web Audio.
+**Front end and HUD.** The menus sit on a live 3D scene of the Şuşa fortress at dawn (walls, round towers and the gatehouse over a misty gorge, two soldiers in the foreground), rendered by the game itself, with a camera shot per screen and mouse parallax. Every screen works by keyboard. In the mission, health is a ring that runs from dark green through yellow and orange to red, armour is a segmented outer ring, and noise is a live meter; the weapon panel shows rounds, fire mode, suppressor wear and the equipment slots. The main task has an amber diamond and optional tasks a blue hexagon, on the task list, the compass bar, the minimap and the map. Settings can add health numbers and an FPS counter.
+
+**Animations.** Medkits, bandages, tourniquets, armour plates, the suppressor brush, every throwable (the pin and spoon fly off a grenade) and C4 (pressed on, then a firing device squeezed) have first-person animations that blend back to the gun if you are hit. Explosions have a fireball, sparks and debris, a dust ring, a drifting smoke column and a scorch mark, all from fixed pools (`vm-items.js`, `fx.js`).
+
+**Rendering.** PBR textures with normal and roughness maps drawn on canvases at start-up, automatic quality with dynamic resolution, MSAA and stable shadows, bloom on lamps, fire and explosions, a drifting cloud layer, dithering against banding, AgX tone mapping and sky-based lighting. Sounds and the three music layers are synthesised with Web Audio.
 
 **Saves.** Checkpoints save position, health, loadout, wrecks and door states to the browser when nobody is fighting you.
 
 ## Controls
 
-All keys can be rebound in Settings.
+All keys can be rebound in Settings. Menus: arrow keys (or W/S) to move, Enter to choose, Esc to go back, left/right to change settings.
 
 | Action | Key | Action | Key |
 |---|---|---|---|
@@ -89,9 +94,9 @@ cd app && npm run test:unit
 | Path | Purpose |
 |---|---|
 | `app/public/index.html`, `client.js` | Entry point |
-| `app/public/js/` | One module per system: player, weapons, ballistics, equipment, ai, ai-fsm, stealth, noise, physics, nav, vehicles, interiors, hud, audio, render, textures, models, save, loc (all strings), config (all numbers) |
+| `app/public/js/` | One module per system: player, weapons, ballistics, equipment, ai, ai-fsm, stealth, noise, physics, nav, vehicles, interiors, furnishings, vm-items (first-person item animations), menu-scene and fortress (the menu backdrop), hud, audio, render, textures, models, save, loc (all strings), config (all numbers) |
 | `app/public/js/levels/` | The four acts |
-| `app/public/dev/` | Viewers for soldiers, weapons, vehicles, houses and scenery |
+| `app/public/dev/` | Viewers for soldiers, weapons, item animations, vehicles, houses and scenery |
 | `app/public/vendor/` | Three.js (MIT) |
 | `app/src/logic.js` | Mission record and validated end-of-mission score kept by the server |
 | `app/tests-node/` | Unit tests (`node --test`) |

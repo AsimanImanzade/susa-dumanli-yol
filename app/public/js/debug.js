@@ -18,7 +18,7 @@ import { noise } from './noise.js';
 import { ui } from './ui.js';
 import { hud } from './hud.js';
 
-let el = null, frames = 0, acc = 0, fps = 0, worst = 0;
+let el = null, fpsEl = null, frames = 0, acc = 0, fps = 0, worst = 0;
 
 export const debug = {
   init() {
@@ -30,6 +30,12 @@ export const debug = {
       el.id = 'debug';
       document.body.appendChild(el);
     }
+    // the player's FPS counter (Settings → HUD): reuses the half-second average below
+    fpsEl = document.createElement('div');
+    fpsEl.id = 'fps';
+    fpsEl.className = 'hidden';
+    fpsEl.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(fpsEl);
     const errors = [];
     window.addEventListener('error', (e) => errors.push(String(e.message)));
     window.addEventListener('unhandledrejection', (e) => errors.push('rejection: ' + String(e.reason && e.reason.message || e.reason)));
@@ -70,10 +76,16 @@ export const debug = {
   },
 
   frame(dtReal) {
-    if (!el) return;
     frames++; acc += dtReal; worst = Math.max(worst, dtReal);
     if (acc < 0.5) return;
     fps = frames / acc;
+    // at most two DOM writes a second
+    const show = !!(G.settings && G.settings.showFps);
+    if (fpsEl) {
+      fpsEl.classList.toggle('hidden', !show);
+      if (show) { const f = Math.round(fps); fpsEl.textContent = f + ' FPS'; fpsEl.className = f >= 55 ? '' : f >= 30 ? 'mid' : 'low'; }
+    }
+    if (!el) { frames = 0; acc = 0; worst = 0; return; }
     const i = R.info(), p = G.player;
     el.textContent = `${fps.toFixed(0)} fps  worst ${(worst * 1000).toFixed(1)} ms  calls ${i.calls}  tris ${(i.tris / 1000).toFixed(1)}k  geo ${i.geos} tex ${i.tex}` +
       (p && G.mission ? `\nact ${G.mission.act}  pos ${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}  light ${p.light.toFixed(2)}  alert ${ai.globalAlert}  enemies ${G.enemies.filter((e) => e.alive).length}  t ${G.simTime.toFixed(0)}s` : '');

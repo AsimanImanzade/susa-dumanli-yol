@@ -32,6 +32,8 @@ export class Player {
     this.stride = 0; this.bobT = 0; this.bob = 0;
     this.dragging = null; this.ladder = null; this.vault = null;
     this.dead = false; this.lastDamageT = -100; this.flash = 0; this.shake = 0;
+    if (this.vigLift) R.post.vignette -= this.vigLift;   // a relief cut short gives its vignette lift back
+    this.relief = 0; this.vigLift = 0;
     this.kickPitch = 0; this.kickYaw = 0;       // recoil, added by weapons.js
     this.frozen = false;                        // cinematics / climbing own the body
     this.lookLocked = false;                    // takedown / cinematics own the view
@@ -266,10 +268,14 @@ export class Player {
     if (this.dead) cam.position.y = b.y + 0.35;
     // post effects that follow the player's condition
     const low = this.health < PLAYER.lowHealth ? 1 - this.health / PLAYER.lowHealth : 0;
-    R.post.blur = damp(R.post.blur, low * 1.1 + this.flash * 2.0, 6, dt);
-    R.post.desat = damp(R.post.desat, low * 0.75, 4, dt);
-    R.post.damage = Math.max(low * 0.35, R.post.damage - dt * 0.9);
-    R.post.flash = this.flash > 0.02 ? Math.min(1, this.flash * 1.4) : 0;
+    // relief after a medkit or bandage (vm-items.js sets relief = 1): blur and grey let go slowly, the image lifts a touch
+    const rl = this.relief = Math.max(0, (this.relief || 0) - dt * 0.6), lift = rl > 0 ? Math.sin(Math.PI * (1 - rl)) : 0;
+    R.post.blur = damp(R.post.blur, low * 1.1 + this.flash * 2.0, rl > 0 ? 2.2 : 6, dt);
+    R.post.desat = damp(R.post.desat, low * 0.75, rl > 0 ? 1.5 : 4, dt);
+    R.post.damage = Math.max(low * 0.35, R.post.damage - dt * (rl > 0 ? 1.8 : 0.9));
+    R.post.flash = Math.max(this.flash > 0.02 ? Math.min(1, this.flash * 1.4) : 0, lift * 0.03);
+    const vd = -0.1 * lift;                     // a delta, so whoever set the base vignette keeps it
+    R.post.vignette += vd - (this.vigLift || 0); this.vigLift = vd;
   }
 }
 void DEG;

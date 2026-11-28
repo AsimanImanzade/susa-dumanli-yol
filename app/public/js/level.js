@@ -21,7 +21,7 @@ import * as MIL from './military.js';
 import { R } from './render.js';
 import { lampContribution } from './stealth.js';
 import { buildNature } from './nature.js';
-import { buildTownhouse } from './interiors.js';
+import { buildTownhouse, finalizeInteriors } from './interiors.js';
 
 const THIN_WOOD = F.SOLID | F.VISION | F.BULLET | F.THIN;
 
@@ -433,25 +433,107 @@ export class Level {
     this.nav = new NavGrid(this.world, noWalk);
     this._buildMap();
     finalizeStructures(this);
+    finalizeInteriors(this);
     G.scene.add(this.group);
     R.setLamps(this.lamps.filter((l) => !l.noLight));
     return this;
   }
 
   /** Top-down map image for the minimap and the full map screen. */
+  /**
+   * Terrain at one sample per metre (surface colour, roads and squares picked out by their
+   * lighter tint, brightened with height and hill-shaded from the north-west), then bushes,
+   * tree canopies, rocks, enterable floors, and every solid collider by kind: walls and
+   * ramparts as light strokes, buildings as roofs with a drop shadow and outline (a house's
+   * ridge box draws as its tin ridge), low cover as small dark blocks. Built once per act.
+   */
   _buildMap() {
     const b = this.bounds, s = 3, w = Math.ceil((b.maxX - b.minX) * s), h = Math.ceil((b.maxZ - b.minZ) * s);
     const c = document.createElement('canvas'); c.width = w; c.height = h;
     const g = c.getContext('2d');
-    g.fillStyle = '#20262a'; g.fillRect(0, 0, w, h);
-    g.fillStyle = '#2a3a30';
-    for (const f of this.bushes) { g.beginPath(); g.arc((f.x - b.minX) * s, (f.z - b.minZ) * s, f.r * s, 0, 6.28); g.fill(); }
+    const to = this.terrainOpts || {}, surf = to.surface, tint = to.tint;
+    const nx = Math.ceil(b.maxX - b.minX) + 1, nz = Math.ceil(b.maxZ - b.minZ) + 1, n = nx * nz;
+    const hgt = new Float32Array(n), lum = new Float32Array(n), kind = new Array(n);
+    let lo = Infinity, hi = -Infinity, lsum = 0;
+    for (let iz = 0, i = 0; iz < nz; iz++) for (let ix = 0; ix < nx; ix++, i++) {
+      const x = b.minX + ix, z = b.minZ + iz, v = this.h(x, z);
+      hgt[i] = v; if (v < lo) lo = v; if (v > hi) hi = v;
+      kind[i] = surf ? surf(x, z) : 'grass';
+      const tv = tint ? tint(x, z) : 0x9a9a9a;
+      lum[i] = ((tv >> 16 & 255) * 0.3 + (tv >> 8 & 255) * 0.59 + (tv & 255) * 0.11) / 255; lsum += lum[i];
+    }
+    const range = hi - lo > 0.5 ? hi - lo : 0, lmean = lsum / n;          // flat acts (the cliff) get no height tint
+    const BASE = { grass: [42, 56, 44], dirt: [80, 71, 54], stone: [66, 68, 66], cobble: [66, 68, 66], rock: [64, 63, 60], wood: [70, 58, 44], metal: [60, 62, 64] };
+    const tc = document.createElement('canvas'); tc.width = nx; tc.height = nz;
+    const tg = tc.getContext('2d'), img = tg.createImageData(nx, nz), d = img.data;
+    const Lx = -0.55, Ly = 0.75, Lz = -0.55;                                 // light from the north-west, above
+    for (let iz = 0, i = 0; iz < nz; iz++) for (let ix = 0; ix < nx; ix++, i++) {
+      const col = BASE[kind[i]] || [40, 46, 48];
+      const dx = (hgt[iz * nx + Math.min(nx - 1, ix + 1)] - hgt[iz * nx + Math.max(0, ix - 1)]) / 2;
+      const dz = (hgt[Math.min(nz - 1, iz + 1) * nx + ix] - hgt[Math.max(0, iz - 1) * nx + ix]) / 2;
+      const nl = Math.hypot(dx, 1, dz), shade = Math.min(1.35, Math.max(0.45, 0.35 + 0.9 * ((-dx * Lx + Ly - dz * Lz) / nl)));
+      const elev = range ? 0.82 + (hgt[i] - lo) / range * 0.36 : 1;
+      const road = Math.min(1.4, Math.max(0.8, 1 + (lum[i] - lmean) * 2.6));
+      const k = shade * elev * road;
+      d[i * 4] = Math.min(255, col[0] * k); d[i * 4 + 1] = Math.min(255, col[1] * k); d[i * 4 + 2] = Math.min(255, col[2] * k); d[i * 4 + 3] = 255;
+    }
+    tg.putImageData(img, 0, 0);
+    g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+    g.drawImage(tc, -s / 2, -s / 2, nx * s, nz * s);
+    const X = (x) => (x - b.minX) * s, Z = (z) => (z - b.minZ) * s;
+    // vegetation and rocks
+    g.fillStyle = 'rgba(45,74,49,0.8)';
+    for (const f of this.bushes) { g.beginPath(); g.arc(X(f.x), Z(f.z), f.r * s, 0, 6.283); g.fill(); }
+    for (const tr of this.rocks) { g.fillStyle = '#6f6b63'; g.beginPath(); g.arc(X(tr.x), Z(tr.z), 0.8 * tr.s * s, 0, 6.283); g.fill(); }
+    for (const tr of this.trees) {
+      const r = (tr.kind ? 1.8 : 2.4) * tr.s * s, x = X(tr.x), z = Z(tr.z);
+      g.fillStyle = 'rgba(0,0,0,0.35)'; g.beginPath(); g.arc(x + 2, z + 2, r, 0, 6.283); g.fill();
+      g.fillStyle = tr.kind ? '#24402a' : '#1d3624'; g.strokeStyle = '#2f5236'; g.lineWidth = 1;
+      g.beginPath(); g.arc(x, z, r, 0, 6.283); g.fill(); g.stroke();
+      g.fillStyle = '#43674a'; g.beginPath(); g.arc(x - r * 0.2, z - r * 0.2, Math.max(1, r * 0.22), 0, 6.283); g.fill();
+    }
+    // enterable buildings: floors under their walls
+    for (const r of this.indoor) {
+      g.save(); g.translate(X(r.x), Z(r.z)); g.rotate(-Math.atan2(r.s, r.c));
+      g.fillStyle = 'rgba(0,0,0,0.4)'; g.fillRect(-r.hx * s + 2, -r.hz * s + 2, r.hx * 2 * s, r.hz * 2 * s);
+      g.fillStyle = '#5c574d'; g.fillRect(-r.hx * s, -r.hz * s, r.hx * 2 * s, r.hz * 2 * s);
+      g.restore();
+    }
+    // solid colliders, low first so roofs and walls end up on top
+    const ROOF = { stone: '#8b8374', plaster: '#9b907d', concrete: '#83837d', metal: '#7a5f4b', rock: '#77736b', wood: '#7d6648', woodThin: '#8a6f4e', armor: '#4c5446' };
+    const list = [];
     for (const col of this.world.colliders) {
-      if (col.dead || !(col.flags & F.SOLID) || col.hy < 0.7 || col.hx * col.hz < 0.2) continue;
-      g.save();
-      g.translate((col.x - b.minX) * s, (col.z - b.minZ) * s); g.rotate(-col.rot);
-      g.fillStyle = col.hy > 1.6 ? '#8f8a7c' : '#5d5a52';
-      g.fillRect(-col.hx * s, -col.hz * s, col.hx * 2 * s, col.hz * 2 * s);
+      if (col.dead || !(col.flags & F.SOLID) || col.hx * col.hz < 0.05) continue;
+      if (col.tag === 'gun' || col.tag === 'mortar' || col.tag === 'apc' || col.tag === 'tank' || col.tag === 'relay') continue;
+      const top = col.y + col.hy - this.h(col.x, col.z);
+      if (top < 0.45) continue;
+      list.push({ col, top });
+    }
+    list.sort((a, b2) => a.top - b2.top);
+    for (const { col, top } of list) {
+      const thin = Math.min(col.hx, col.hz), long = Math.max(col.hx, col.hz);
+      const hx = Math.max(col.hx * s, 0.8), hz = Math.max(col.hz * s, 0.8);
+      g.save(); g.translate(X(col.x), Z(col.z)); g.rotate(-col.rot);
+      if (thin < 0.6 && long > 0.9 && top > 0.9) {                                  // wall or fence
+        g.fillStyle = col.mat === 'woodThin' || col.mat === 'wood' ? '#9a7d58' : '#c4baa2';
+        g.strokeStyle = 'rgba(0,0,0,0.55)'; g.lineWidth = 1;
+        g.strokeRect(-hx - 0.5, -hz - 0.5, hx * 2 + 1, hz * 2 + 1); g.fillRect(-hx, -hz, hx * 2, hz * 2);
+      } else if (thin >= 0.9 && top > 4 && long / thin > 3 && col.mat !== 'rock') {                     // rampart
+        g.fillStyle = 'rgba(0,0,0,0.45)'; g.fillRect(-hx + 2, -hz + 2, hx * 2, hz * 2);
+        g.fillStyle = '#cbc1a7'; g.fillRect(-hx, -hz, hx * 2, hz * 2);
+        g.strokeStyle = '#5b5446'; g.lineWidth = 1.2; g.strokeRect(-hx, -hz, hx * 2, hz * 2);
+        g.strokeStyle = 'rgba(91,84,70,0.6)'; g.setLineDash([2, 3]); g.beginPath();
+        if (col.hx > col.hz) { g.moveTo(-hx, 0); g.lineTo(hx, 0); } else { g.moveTo(0, -hz); g.lineTo(0, hz); }
+        g.stroke(); g.setLineDash([]);
+      } else if (top > 2.4) {                                                        // building, roof, tall rock
+        g.fillStyle = 'rgba(0,0,0,0.42)'; g.fillRect(-hx + 2.5, -hz + 2.5, hx * 2, hz * 2);
+        g.fillStyle = ROOF[col.mat] || '#8f8a7c'; g.fillRect(-hx, -hz, hx * 2, hz * 2);
+        g.fillStyle = 'rgba(255,255,255,0.08)'; g.fillRect(-hx, -hz, hx * 2, Math.min(hz, 2));
+        g.strokeStyle = '#2b2925'; g.lineWidth = 1.2; g.strokeRect(-hx, -hz, hx * 2, hz * 2);
+      } else {                                                                        // low cover: crates, sandbags, cars
+        g.fillStyle = '#56534b'; g.fillRect(-hx, -hz, hx * 2, hz * 2);
+        g.strokeStyle = 'rgba(0,0,0,0.5)'; g.lineWidth = 0.8; g.strokeRect(-hx, -hz, hx * 2, hz * 2);
+      }
       g.restore();
     }
     this.map = { canvas: c, scale: s, minX: b.minX, minZ: b.minZ };

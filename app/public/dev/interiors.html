@@ -26,6 +26,8 @@
  *   ?show=street|garrison|tall|hut        what to build
  *   &env=streets|forest|dawnStart|studio   lighting preset
  *   &cam=<preset>  or  &c=x,y,z,tx,ty,tz  camera     &shadows=1   &ui=0
+ *   presets: street hall stairs upstairs post roof, one per room kind (kitchen, living, bedroom, store, guard,
+ *   radio, post…) and r<house>_<floor>_<room> for every room (window.__viewer.CAMS lists them)
  *
  * window.__viewer: render(), cam(x,y,z,tx,ty,tz), preset(name), stats(), L (the level), houses.
  */
@@ -96,6 +98,20 @@ const CAMS = {
   post: post.face !== undefined ? [post.x + Math.sin(post.face) * 2.4, post.y + 1.7, post.z + Math.cos(post.face) * 2.4, post.x, post.y + 1.2, post.z] : [h0.x, 2, h0.z + 8, h0.x, 1, h0.z],
   roof: [h0.x + 18, h0.top + 8, h0.z + 18, h0.x, h0.top - 2, h0.z],
 };
+// one preset per room kind (the first room of that kind in the first house that has one), from a corner at eye height
+/** a room's camera: from the corner nearest its doorway side, looking at the far corner */
+function roomCam(h, rm) {
+  const p = h.plan, y = (rm.f === 0 ? p.gyC((rm.a0 + rm.a1) / 2, (rm.b0 + rm.b1) / 2) : p.fy[rm.f]) + 1.62;
+  const a0 = rm.a0 + 0.35, b0 = rm.b0 + 0.35, a1 = rm.a1 - 0.3, b1 = rm.b1 - 0.3, c = [(rm.a0 + rm.a1) / 2, (rm.b0 + rm.b1) / 2];
+  const corners = [[a0, b0, a1, b1], [a1, b1, a0, b0], [a0, b1, a1, b0], [a1, b0, a0, b1]];
+  const [ea, eb, ta, tb] = corners[(rm.id + rm.f) % 4];
+  return [...P3h(h, ea, y, eb), ...P3h(h, (ta + c[0]) / 2, y - 0.55, (tb + c[1]) / 2)];
+}
+function P3h(h, a, y, b) { const p = h.plan.Pc(a, b); return [p[0], y, p[1]]; }
+for (const h of houses) for (const rm of h.plan.roomsF) {
+  if (!CAMS[rm.kind]) CAMS[rm.kind] = roomCam(h, rm);
+  CAMS[`r${houses.indexOf(h)}_${rm.f}_${rm.id}`] = roomCam(h, rm);
+}
 let C = CAMS[S.cam] || CAMS.street;
 if (q.has('c')) C = q.get('c').split(',').map(Number);
 const info = document.getElementById('info');
@@ -111,7 +127,7 @@ function render() {
   info.textContent = `show ${S.show}  build ${tBuild.toFixed(0)} ms  calls ${renderer.info.render.calls}  tris ${(renderer.info.render.triangles / 1000).toFixed(1)}k  colliders ${L.world.colliders.length}  doors ${L.doorSys ? L.doorSys.doors.length : 0}  lamps ${L.lamps.length}`;
 }
 const rows = document.getElementById('rows');
-const OPTS = { show: ['street', 'garrison', 'tall', 'hut'], env: ['streets', 'forest', 'dawnStart', 'studio'], cam: Object.keys(CAMS) };
+const OPTS = { show: ['street', 'garrison', 'tall', 'hut'], env: ['streets', 'forest', 'dawnStart', 'studio'], cam: Object.keys(CAMS).filter((k) => !/^r\d/.test(k)) };
 for (const [k, list] of Object.entries(OPTS)) {
   const r = document.createElement('div'); r.className = 'row'; r.textContent = k + ': ';
   for (const v of list) {

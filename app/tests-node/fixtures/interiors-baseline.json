@@ -1,0 +1,152 @@
+[
+ {
+  "spots": "cb1f549b2f6d523e",
+  "boxes": "3ee0366429715769",
+  "nBoxes": 254,
+  "furn": "4852b41cdf2805ba",
+  "nFurn": 78,
+  "doors": "15ee24ec5f370681",
+  "lamps": "8ffd768212b5164f",
+  "windows": "85916be0f027f871"
+ },
+ {
+  "spots": "f2af7670e73e9395",
+  "boxes": "ff8ba33fee7ee5b3",
+  "nBoxes": 263,
+  "furn": "247fa2ccf77a1845",
+  "nFurn": 86,
+  "doors": "fb6d5a75be072e1d",
+  "lamps": "eee66d3e92d35563",
+  "windows": "9fa625dbebb025d4"
+ },
+ {
+  "spots": "5b367f051f71c54b",
+  "boxes": "7bd5af95caab2a4a",
+  "nBoxes": 239,
+  "furn": "3a72e6f83d492e2e",
+  "nFurn": 67,
+  "doors": "c2591fade0436286",
+  "lamps": "37e94d1dfdedaecc",
+  "windows": "5a84478979fb9fb2"
+ },
+ {
+  "spots": "aa17233f337bbca3",
+  "boxes": "6b69a42c8f5b1420",
+  "nBoxes": 421,
+  "furn": "d6a2d9f5d35066fd",
+  "nFurn": 162,
+  "doors": "81a7d344b2c6b9f8",
+  "lamps": "033d8cf825902c0d",
+  "windows": "1066e717cbc307a8"
+ },
+ {
+  "spots": "a099503fbdf07514",
+  "boxes": "f27d3489dec72cb5",
+  "nBoxes": 170,
+  "furn": "82ac361bc407a8b3",
+  "nFurn": 39,
+  "doors": "d0bc03f60351dd98",
+  "lamps": "254562ca7a6c7699",
+  "windows": "c58f4129be53f29c"
+ },
+ {
+  "spots": "f775745e98b22800",
+  "boxes": "3013c6590cf5641c",
+  "nBoxes": 20,
+  "furn": "2fb4c75cb122f816",
+  "nFurn": 5,
+  "doors": "174200f12619dec3",
+  "lamps": "dd8a957fa307c0fd",
+  "windows": "a0fd69ef7e6064ca"
+ },
+ {
+  "spots": "862d35e5614152f2",
+  "boxes": "760bb0dd95c0dc73",
+  "nBoxes": 260,
+  "furn": "b0ccaf1a7dd054f6",
+  "nFurn": 79,
+  "doors": "ddda73d474709138",
+  "lamps": "18f609d87506e255",
+  "windows": "78747d2b7f821f30"
+ },
+ {
+  "spots": "c60ef05b5833c071",
+  "boxes": "deadf90b3c2d973c",
+  "nBoxes": 269,
+  "furn": "36c577dc63432503",
+  "nFurn": 90,
+  "doors": "fb6d5a75be072e1d",
+  "lamps": "8a2c3fe5113899d8",
+  "windows": "9fa625dbebb025d4"
+ },
+ {
+  "spots": "2f8e5dd3ba2d497e",
+  "boxes": "583315b5ea9a13c9",
+  "nBoxes": 169,
+  "furn": "a02b45bfdfefffb7",
+  "nFurn": 43,
+  "doors": "35a068cacd552a83",
+  "lamps": "d5c43060c07eb65d",
+  "windows": "c67a13a33b7f8fc6"
+ },
+ {
+  "spots": "916b72ebaeb11615",
+  "boxes": "931992e3df7f5789",
+  "nBoxes": 417,
+  "furn": "feb6f773f63518cb",
+  "nFurn": 159,
+  "doors": "0cafbae8caa2de10",
+  "lamps": "de2d42e43f4bf7a5",
+  "windows": "b5b2c8c77be93021"
+ },
+ {
+  "spots": "aa17233f337bbca3",
+  "boxes": "fec58eb31b3b1824",
+  "nBoxes": 422,
+  "furn": "d6a2d9f5d35066fd",
+  "nFurn": 162,
+  "doors": "81a7d344b2c6b9f8",
+  "lamps": "033d8cf825902c0d",
+  "windows": "f90ed53718d6174e"
+ },
+ {
+  "spots": "42a28630a479b811",
+  "boxes": "02b629229a662d52",
+  "nBoxes": 22,
+  "furn": "ffa79cba6edda07a",
+  "nFurn": 6,
+  "doors": "588e9262862f807c",
+  "lamps": "d3a21f5a9d72e0b3",
+  "windows": "0bfd8e964c85dbbc"
+ },
+ {
+  "spots": "8442c448cae3b6b0",
+  "boxes": "32d3d9b8a2ff9540",
+  "nBoxes": 258,
+  "furn": "af6e0ba82fc1abf6",
+  "nFurn": 81,
+  "doors": "0c0140c6fc35d896",
+  "lamps": "9577aa512c66a55e",
+  "windows": "03795d56c4ededc8"
+ },
+ {
+  "spots": "e00a0246938cbf1c",
+  "boxes": "e5c46f766cf31390",
+  "nBoxes": 245,
+  "furn": "d18d0dc0e7a958f6",
+  "nFurn": 82,
+  "doors": "4d7151a11c817dda",
+  "lamps": "40fc416152b9808e",
+  "windows": "6ff468641493b2aa"
+ },
+ {
+  "spots": "024229fc399cf2a1",
+  "boxes": "9c1e8106bb531e6c",
+  "nBoxes": 235,
+  "furn": "8741b4178c22844c",
+  "nFurn": 64,
+  "doors": "1532d6c354fb2a53",
+  "lamps": "bf5054e961c1fc86",
+  "windows": "7867c66da42230c7"
+ }
+]

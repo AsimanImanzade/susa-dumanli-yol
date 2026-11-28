@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Item animations</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #20242a; color: #cfd6dc; font: 12px/1.4 ui-monospace, Menlo, monospace; overflow: hidden; }
+  canvas { display: block; }
+  #info { position: fixed; left: 6px; top: 4px; white-space: pre; pointer-events: none; text-shadow: 0 1px 2px #000; }
+</style>
+<script type="importmap">{ "imports": { "three": "../vendor/three.module.js" } }</script>
+</head>
+<body>
+<div id="info">loading…</div>
+<script type="module">
+/**
+ * dev/items.html — the first-person item animations (js/vm-items.js) frozen at a
+ * few moments, one tile each, in the view-model camera (55°, 16:9 tiles).
+ *   ?kind=medkit|bandage|tourniquet|plate|repair|frag|smoke|flash|stone|tknife|c4|clacker
+ *   ?ks=0.1,0.3,0.5   (use fraction for items; seconds for throws, C4 and the clacker: 0..0.5 squeeze, then 0.5 + seconds after the blast)
+ *   ?w=akm            the gun on screen for repair   ?cols=3
+ *   ?step=1           run the state machine in time instead (ks in seconds): ?rel=0.7 throw release, ?int=1.5 interrupt
+ */
+import * as THREE from 'three';
+import * as WM from '../js/weapon-models.js';
+import { G } from '../js/ctx.js';
+import { vmItems } from '../js/vm-items.js';
+
+const q = new URLSearchParams(location.search);
+const kind = q.get('kind') || 'medkit', ks = (q.get('ks') || '0.1,0.3,0.5,0.7').split(',').map(Number), cols = +(q.get('cols') || Math.min(3, ks.length));
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace; renderer.setScissorTest(true);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x5d6670);
+const hemi = new THREE.HemisphereLight(0xb8c0c8, 0x5a5650, 1.7), sun = new THREE.DirectionalLight(0xfff4e6, 1.3);
+sun.position.set(0.4, 1, 0.6); scene.add(hemi, sun);
+const env = WM.createVmEnvironment(renderer); env.sync(hemi.color, hemi.groundColor, sun.color);
+scene.environment = env.texture; scene.environmentIntensity = 0.9;
+// a floor line so the frame has a horizon
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshLambertMaterial({ color: 0x4a4e44 })); floor.rotation.x = -Math.PI / 2; floor.position.y = -1.6; scene.add(floor);
+G.vmScene = scene;
+G.equip = { anim: { use: 0, item: null, thrown: 0, placed: 0, det: 0 }, c4s: [], c4Hold: 0, c4Placed: false, using: null, cook: null };
+G.weapons = { lastShot: 0, ads: 0 };
+const t0 = performance.now();
+vmItems.init();
+const buildMs = Math.round(performance.now() - t0);
+let vm = null;
+if (kind === 'repair') {
+  vm = WM.buildViewModel(q.get('w') || 'akm'); vm.sup.visible = true; scene.add(vm.root);
+  if (vm.handL) vm.handL.visible = false;
+}
+const cam = new THREE.PerspectiveCamera(55, 16 / 9, 0.01, 10);
+const rows = Math.ceil(ks.length / cols), W = innerWidth / cols, H = W * 9 / 16;
+let calls = 0;
+const tile = (i) => {
+  const x = (i % cols) * W, y = innerHeight - (Math.floor(i / cols) + 1) * H;
+  renderer.setViewport(x, y, W - 2, H - 2); renderer.setScissor(x, y, W - 2, H - 2);
+  renderer.render(scene, cam); calls += renderer.info.render.calls;
+};
+if (q.get('step')) {
+  // run the real state machine at 60 Hz, as equipment.js would drive it: ?rel= release / ?int= interrupt (seconds)
+  const e = G.equip, A = e.anim, dt = 1 / 60, rel = +(q.get('rel') || 0.7), int = q.get('int') ? +q.get('int') : -1;
+  const DUR = { medkit: 4, bandage: 2, tourniquet: 1.6, plate: 3, repair: 2.2 };
+  const dummy = new THREE.Object3D(); scene.add(dummy);
+  let t = 0, n = 0;
+  const throwable = ['frag', 'smoke', 'flash', 'stone', 'tknife'].includes(kind);
+  if (throwable) e.cook = { t: 0, kind };
+  else if (DUR[kind]) e.using = { item: kind, t: 0, dur: DUR[kind] };
+  else if (kind === 'c4') { e.c4s.push({ mesh: dummy }); A.placed++; }
+  else if (kind === 'clacker') { e.c4s.push({ mesh: dummy }); }
+  while (n < ks.length && t < 10) {
+    if (e.cook) { e.cook.t = t; if (t >= rel) { e.cook = null; A.thrown++; } }
+    if (e.using) { e.using.t = t; if (int >= 0 && t >= int) e.using = null; else if (t >= e.using.dur) { A.use++; A.item = kind; e.using = null; } }
+    if (kind === 'clacker') { if (t < 0.5) e.c4Hold = t; else if (e.c4Hold >= 0) { e.c4Hold = -99; A.det++; } if (t > 1.0) e.c4Hold = 0; }
+    vmItems.frame(dt, {});
+    while (n < ks.length && t + 1e-6 >= ks[n]) tile(n++);
+    t += dt;
+  }
+} else ks.forEach((k, i) => {
+  vmItems.freeze = { kind, k };
+  if (vm) {   // the gun as weapons.frame poses it, with the item offsets
+    vmItems.frame(0, vm);
+    const g = vmItems.gun, r = vm.root;
+    r.position.set(vm.hip[0] + g.x, vm.hip[1] + g.y, vm.hip[2] + g.z); r.rotation.set(vm.hipRot[0] + g.rx, vm.hipRot[1] + g.ry, vm.hipRot[2] + g.rz);
+  }
+  vmItems.frame(0, vm || {});
+  tile(i);
+});
+const split = ['frag', 'smoke', 'flash'].map((k) => k + (vmItems.items[k].pin ? ':split' : ':whole')).join(' ');
+document.getElementById('info').textContent = `${kind}  ${q.get('step') ? 't' : 'k'} ${ks.join(' ')}   kit ${vmItems.kitMs} ms  init ${buildMs} ms  calls ${calls}  ${split}`;
+window.__items = { ready: true };
+void rows;
+</script>
+</body>
+</html>

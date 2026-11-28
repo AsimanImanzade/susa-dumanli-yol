@@ -10,9 +10,9 @@ import assert from 'node:assert/strict';
 import { World, F } from '../public/js/physics.js';
 import { NavGrid } from '../public/js/nav.js';
 import { NOISE } from '../public/js/config.js';
-import { planTownhouse, solidRects, floorIndex, DOOR, stepDoor, doorBlocks, doorNoise, encodeDoors, decodeDoors, doorSuspicious, THIN_WOOD } from '../public/js/interior-rules.js';
+import { planTownhouse, solidRects, floorIndex, DOOR, stepDoor, doorBlocks, doorNoise, encodeDoors, decodeDoors, doorSuspicious, THIN_WOOD, checkDress } from '../public/js/interior-rules.js';
+import { BASE_HOUSES, readBaseline, digest, slope } from './fixtures/interiors-baseline.mjs';
 
-const slope = (x, z) => (50 - z) * 0.022 + Math.sin(x * 0.3) * 0.05;
 const HOUSES = [
   { x: -12.5, z: 28, w: 15, d: 24, door: 'e', back: 'w', floors: 2, low: true },
   { x: 12.5, z: -4.5, w: 15, d: 27, door: 'w', floors: 2, garrison: true },
@@ -72,8 +72,8 @@ test('doors: only a Hard patrol notices one the player changed, and only once', 
   assert.ok(!doorSuspicious(true, { byPlayer: true, noticed: true }, 'patrol'));
 });
 
-for (const o of HOUSES) {
-  test(`townhouse ${o.w}×${o.d}, ${o.floors} floor(s) at ${o.x},${o.z}: every room reachable, stairs climbable`, () => {
+for (const o of BASE_HOUSES) {
+  test(`townhouse ${o.w}×${o.d}, ${o.floors} floor(s) at ${o.x},${o.z}${o.seed !== undefined ? ' seed ' + o.seed : ''}: every room reachable, stairs climbable (household pieces in place)`, () => {
     const { pl, world } = build(o);
     // a shut door on every doorway must not cut the nav grid
     for (const dr of pl.doors) {
@@ -107,6 +107,74 @@ for (const o of HOUSES) {
     for (const a of pl.rooms) for (const b of pl.rooms) if (a !== b) assert.ok(!(a.a0 < b.a1 - 1e-6 && a.a1 > b.a0 + 1e-6 && a.b0 < b.b1 - 1e-6 && a.b1 > b.b0 + 1e-6), 'rooms overlap');
   });
 }
+
+test('the furnishing pass never moves what the levels index: spots, colliders and first-pass furniture match the baseline', () => {
+  const base = readBaseline();
+  assert.equal(base.length, BASE_HOUSES.length);
+  BASE_HOUSES.forEach((o, i) => {
+    const pl = planTownhouse({ ...o, gy: slope });
+    const n = pl.dressFrom ?? pl.boxes.length;
+    assert.equal(n, base[i].nBoxes, `house ${i}: first-pass collider count`);
+    const d = digest(pl, n);
+    for (const k of Object.keys(base[i])) assert.equal(d[k], base[i][k], `house ${i} (${o.x},${o.z}): ${k} changed`);
+  });
+});
+
+// a sweep of other houses: sizes, storeys, doors, garrisons and seeds the acts do not use (yet)
+const SWEEP = [];
+{
+  let s = 12345;
+  const r = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+  const sides = ['s', 'e', 'n', 'w'];
+  for (let i = 0; i < 48; i++) {
+    const door = sides[Math.floor(r() * 4)];
+    SWEEP.push({ x: Math.round((r() - 0.5) * 80) + 0.5, z: Math.round((r() - 0.5) * 120) + 0.5, w: 6 + Math.round(r() * 24), d: 5 + Math.round(r() * 23), door,
+      back: r() < 0.25 ? false : undefined, floors: 1 + Math.floor(r() * 3), garrison: r() < 0.4, low: r() < 0.3, roof: r() < 0.3 ? 'flat' : undefined, seed: Math.floor(r() * 1e9), rot: r() < 0.2 ? r() * 0.8 : 0 });
+  }
+}
+
+test('household pieces keep clear of stands, loot, sentries, doorways, stairs, climb-in windows and each other', () => {
+  let n = 0;
+  for (const o of [...BASE_HOUSES, ...SWEEP]) {
+    const pl = planTownhouse({ ...o, gy: slope });
+    const bad = checkDress(pl);
+    assert.deepEqual(bad, [], `house at ${o.x},${o.z} (${o.w}×${o.d}, ${o.floors} fl, seed ${o.seed}): ${bad.slice(0, 4).join('; ')}`);
+    n += pl.boxes.length - pl.dressFrom;
+    // the colliders of the pass are its own pieces', after every first-pass one
+    assert.equal(pl.boxes.length - pl.dressFrom, pl.dress.filter((it) => !it.nocol && !it.deco).length);
+    for (const it of pl.dress) assert.ok(Number.isFinite(it.a) && Number.isFinite(it.b) && Number.isFinite(it.y) && Number.isFinite(it.ry), `${it.kind}: bad numbers`);
+  }
+  assert.ok(n > 300, `only ${n} household colliders over the sweep`);
+});
+
+test('the furnishing pass is deterministic and leaves the sweep houses reachable', () => {
+  for (const o of SWEEP.slice(0, 16)) {
+    const a = planTownhouse({ ...o, gy: slope }), b = planTownhouse({ ...o, gy: slope });
+    assert.equal(JSON.stringify(a.dress), JSON.stringify(b.dress));
+    assert.equal(JSON.stringify(a.winDress.map((q) => [q.f, q.room, q.side, q.s, q.rad, q.curt])), JSON.stringify(b.winDress.map((q) => [q.f, q.room, q.side, q.s, q.rad, q.curt])));
+    const { pl, world } = build(o);
+    const nav = new NavGrid(world, null), path = [];
+    for (const s of pl.spots.stands) assert.ok(nav.findPath(pl.spots.front.x, pl.spots.front.z, s.x, s.z, path), `sweep house ${o.x},${o.z}: room ${s.room} unreachable`);
+  }
+});
+
+test('window sentries still see out past the household pieces', () => {
+  let seen = 0;
+  for (const o of [...BASE_HOUSES, ...SWEEP.slice(0, 20)]) {
+    const pl = planTownhouse({ ...o, gy: slope });
+    const mk = (n) => { const w = new World({ minX: -64, maxX: 64, minZ: -120, maxZ: 64 }, slope, () => 'stone'); for (const b of pl.boxes.slice(0, n)) w.addBox(b); return w; };
+    const before = mk(pl.dressFrom), after = mk(pl.boxes.length);
+    for (const list of pl.spots.posts) for (const q of list) {
+      if (q.radio) continue;
+      const dx = -Math.sin(q.face), dz = -Math.cos(q.face), y = q.y + 1.55;
+      const look = (w) => w.los(q.x, y, q.z, q.x + dx * 2.6, y, q.z + dz * 2.6);
+      if (!look(before)) continue;
+      seen++;
+      assert.ok(look(after), `house ${o.x},${o.z}: the sentry at ${q.x.toFixed(1)},${q.z.toFixed(1)} (floor ${q.f}) lost his view`);
+    }
+  }
+  assert.ok(seen > 100, `only ${seen} posts checked`);
+});
 
 test('doorways on a grid-aligned house sit on nav cell centres', () => {
   const pl = planTownhouse({ ...HOUSES[0], gy: slope });

@@ -7,8 +7,9 @@
  * model drawn on top with a cleared depth buffer (so the gun never pokes
  * through walls) → full-screen pass at canvas resolution: contrast-adaptive
  * sharpen (which also restores detail when the target is rendered below
- * canvas size), AgX tone mapping, then night vision, low-health blur, flash,
- * damage vignette and motion blur.
+ * canvas size), bloom from a small 1/4…1/16 chain, AgX tone mapping, then
+ * night vision, low-health blur, flash, damage vignette, motion blur and a
+ * last ±0.5/255 dither against banding.
  */
 import * as THREE from 'three';
 import { G, clamp01, lerp } from './ctx.js';
@@ -22,18 +23,47 @@ import { setWetness } from './materials.js';
  * of the sun's shadow box · sharpen: CAS strength.
  */
 const QUALITY = {
-  low: { dpr: 1, scale: 0.75, samples: 0, shadows: false, shadowMap: 0, shadowR: 40, rain: 500, lamps: 2, far: 170, sharpen: 0.5 },
-  medium: { dpr: 1.5, scale: 1, samples: 4, shadows: true, shadowMap: 1024, shadowR: 38, rain: 1100, lamps: 4, far: 230, sharpen: 0.35 },
-  high: { dpr: 2, scale: 1, samples: 4, shadows: true, shadowMap: 2048, shadowR: 45, rain: 1800, lamps: 5, far: 300, sharpen: 0.3 },
+  low: { dpr: 1, scale: 0.75, samples: 0, shadows: false, shadowMap: 0, shadowR: 40, rain: 500, lamps: 2, far: 170, sharpen: 0.5, bloom: false },
+  medium: { dpr: 1.5, scale: 1, samples: 4, shadows: true, shadowMap: 1024, shadowR: 38, rain: 1100, lamps: 4, far: 230, sharpen: 0.35, bloom: true },
+  high: { dpr: 2, scale: 1, samples: 4, shadows: true, shadowMap: 2048, shadowR: 45, rain: 1800, lamps: 5, far: 300, sharpen: 0.3, bloom: true },
 };
 const TIERS = ['low', 'medium', 'high'];
 /** dynamic-resolution steps, multiplied onto the tier's scale */
 const DYN = [1, 0.87, 0.75, 0.64];
 
+/**
+ * Bloom: soft-knee bright pass from the HDR scene, then down to 1/4, 1/8 and
+ * 1/16 of the render target and back up (additive), five small passes in all.
+ * Lamps, fires and lit windows are drawn at ≤ 1.0, so the knee sits below
+ * that and works on exposed values; the night acts stay dark because almost
+ * nothing else reaches it. threshold / knee in exposed scene units, clamp
+ * caps one hot texel so a muzzle flash cannot become a pulsing blob.
+ */
+const BLOOM = { threshold: 0.62, knee: 0.3, clamp: 3, strength: 0.45, wQuarter: 0.7, wEighth: 0.9, wSixteenth: 1.0 };
+const BLOOM_FS = `
+precision highp float;
+uniform sampler2D tSrc; uniform vec2 uTexel; uniform float uBright, uExposure, uWeight, uClamp; uniform vec4 uCurve;
+varying vec2 vUv;
+vec3 tap(vec2 o){ return texture2D(tSrc, vUv + o * uTexel).rgb; }
+void main(){
+  // four bilinear taps one source texel off the centre: a 4×4 box (a tent when upsampling)
+  vec3 c = (tap(vec2(-1.0, -1.0)) + tap(vec2(1.0, -1.0)) + tap(vec2(-1.0, 1.0)) + tap(vec2(1.0, 1.0))) * 0.25;
+  if (uBright > 0.5) {
+    c *= uExposure;
+    float br = max(c.r, max(c.g, c.b));
+    float rq = clamp(br - uCurve.y, 0.0, uCurve.z);               // soft knee (threshold − knee … threshold + knee)
+    rq = rq * rq * uCurve.w;
+    c *= max(rq, br - uCurve.x) / max(br, 1e-4);
+    c *= min(1.0, uClamp / max(max(c.r, max(c.g, c.b)), 1e-4));
+  }
+  gl_FragColor = vec4(c * uWeight, 1.0);
+}`;
+
 const POST_VS = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
 const POST_FS = `
 precision highp float;
-uniform sampler2D tScene; uniform sampler2D tPrev;
+uniform sampler2D tScene; uniform sampler2D tPrev; uniform sampler2D tBloom;
+uniform float uBloom; uniform vec2 uBloomTexel;
 uniform float uNV, uBlur, uFlash, uDamage, uTime, uMotion, uDesat, uExposure, uVignette, uScope, uSharp, uSat;
 uniform vec2 uTexel;
 uniform vec3 uTint;
@@ -76,7 +106,12 @@ void main(){
   }
   if (uMotion > 0.001) c = mix(c, texture2D(tPrev, uv).rgb, uMotion);
   c *= uExposure;
-  float lum = dot(c, vec3(0.299, 0.587, 0.114));     // scene light before tone mapping: the intensifier sees this
+  float lum = dot(c, vec3(0.299, 0.587, 0.114));     // scene light before tone mapping: the intensifier sees this (without bloom)
+  if (uBloom > 0.001) {                     // bloom chain (already exposed), a small tent over the 1/4 target
+    vec3 b = texture2D(tBloom, uv + vec2(-0.5, -0.5) * uBloomTexel).rgb + texture2D(tBloom, uv + vec2(0.5, -0.5) * uBloomTexel).rgb
+           + texture2D(tBloom, uv + vec2(-0.5, 0.5) * uBloomTexel).rgb + texture2D(tBloom, uv + vec2(0.5, 0.5) * uBloomTexel).rgb;
+    c += b * (0.25 * uBloom);
+  }
   // AgX toe sits below linear under ~0.02, which would crush the night acts; keep the darks linear (max() stays continuous)
   // (0.88: AgX lifts mid-tones ~12% over the old clamp; this keeps each act about as bright as it was)
   c *= 0.88;
@@ -98,33 +133,78 @@ void main(){
   c = mix(c, vec3(1.0), uFlash);
   gl_FragColor = vec4(c, 1.0);
   #include <colorspace_fragment>
+  // dither against 8-bit banding in sky and fog gradients: ±0.5/255 after the sRGB encode (interleaved gradient noise)
+  gl_FragColor.rgb += (fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5) / 255.0;
 }`;
 
 const SKY_VS = `varying vec3 vDir; void main(){ vDir = normalize(position); vec4 p = modelViewMatrix * vec4(position, 0.0); gl_Position = projectionMatrix * vec4(p.xyz, 1.0); gl_Position.z = gl_Position.w; }`;
 const SKY_FS = `
 precision highp float;
-uniform vec3 uTop, uHorizon, uGlow, uSunDir; uniform float uGlowAmt;
+uniform vec3 uTop, uHorizon, uGlow, uSunDir, uCloudCol; uniform float uGlowAmt, uHPow, uCloud, uCloudT;
+uniform sampler2D tCloud;
 varying vec3 vDir;
 void main(){
   float h = clamp(vDir.y * 1.6 + 0.08, 0.0, 1.0);
-  vec3 c = mix(uHorizon, uTop, pow(h, 0.6));
-  float s = max(0.0, dot(normalize(vDir), normalize(uSunDir)));
-  c += uGlow * (pow(s, 6.0) * 0.55 + pow(s, 60.0) * 0.9) * uGlowAmt * (1.0 - h * 0.6);
+  vec3 c = mix(uHorizon, uTop, pow(h, uHPow));
+  vec3 d = normalize(vDir);
+  float s = max(0.0, dot(d, normalize(uSunDir)));
+  vec3 glow = uGlow * uGlowAmt;
+  c += glow * (pow(s, 6.0) * 0.55 + pow(s, 60.0) * 0.9) * (1.0 - h * 0.6);
+  // cloud layer: one tileable noise texture on a flat ceiling, two scales drifting apart;
+  // faded out toward the horizon (no stretching, the fog seam stays clean)
+  if (uCloud > 0.001 && d.y > 0.0) {
+    vec2 p = d.xz / (d.y + 0.15);
+    float n = texture2D(tCloud, p * 0.17 + vec2(0.0042, 0.0016) * uCloudT).r * 0.64
+            + texture2D(tCloud, p * 0.53 + vec2(0.0085, -0.0021) * uCloudT).r * 0.36;
+    float a = smoothstep(1.0 - uCloud, 1.0 - uCloud + 0.24, n) * smoothstep(0.02, 0.3, d.y);
+    // lit from the sky and moon (uCloudCol), warm where the sun or its glow is; thin edges catch more of it, thick cores darker
+    float edge = 1.0 - smoothstep(0.55, 1.0, n);
+    vec3 cc = uCloudCol * (0.72 + 0.28 * edge) + glow * (0.18 + 0.75 * pow(s, 3.0)) * (0.55 + 0.45 * edge);
+    c = mix(c, cc, a * 0.92);
+  }
   gl_FragColor = vec4(c, 1.0);
 }`;
+
+/** Tileable value noise (3 octaves), 128² in the red channel, built once for the cloud layer. */
+function createCloudTexture() {
+  const N = 128, data = new Uint8Array(N * N * 4), f = new Float32Array(N * N);
+  let seed = 0x5a17c3;
+  const rnd = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const sm = (t) => t * t * (3 - 2 * t);
+  let mn = Infinity, mx = -Infinity;
+  for (const [cells, w] of [[6, 0.55], [12, 0.3], [24, 0.15]]) {
+    const g = Array.from({ length: cells * cells }, rnd), cs = N / cells;
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      const gx = x / cs, gy = y / cs, x0 = Math.floor(gx), y0 = Math.floor(gy), tx = sm(gx - x0), ty = sm(gy - y0);
+      const at = (i, j) => g[((j % cells) * cells) + (i % cells)];
+      const v = lerp(lerp(at(x0, y0), at(x0 + 1, y0), tx), lerp(at(x0, y0 + 1), at(x0 + 1, y0 + 1), tx), ty);
+      f[y * N + x] += v * w;
+    }
+  }
+  for (const v of f) { mn = Math.min(mn, v); mx = Math.max(mx, v); }
+  for (let i = 0; i < N * N; i++) { const v = Math.round((f[i] - mn) / (mx - mn) * 255); data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = v; data[i * 4 + 3] = 255; }
+  const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter; tex.generateMipmaps = true;
+  tex.needsUpdate = true;
+  return tex;
+}
 
 /** Environment presets per act. Colours follow the style formula's palette. */
 export const ENV = {
   forest: { sky: 0x0a0f14, horizon: 0x141c22, fog: 0x121a20, fogDensity: 0.036, ambient: 0x5a6c7c, ambientI: 0.62,
-    sun: 0x8fa6c4, sunI: 0.42, sunDir: [0.4, 0.8, 0.3], glow: 0x000000, glowAmt: 0, light: 0.2, rain: 0, exposure: 1.15 },
+    sun: 0x8fa6c4, sunI: 0.42, sunDir: [0.4, 0.8, 0.3], glow: 0x000000, glowAmt: 0, light: 0.2, rain: 0, clouds: 0.72, exposure: 1.15 },
   cliffs: { sky: 0x0b1118, horizon: 0x18222a, fog: 0x151e25, fogDensity: 0.024, ambient: 0x7186a0, ambientI: 1.0,
-    sun: 0x9db2cc, sunI: 0.46, sunDir: [-0.3, 0.8, 0.4], glow: 0x000000, glowAmt: 0, light: 0.22, rain: 0, exposure: 1.15 },
+    sun: 0x9db2cc, sunI: 0.46, sunDir: [-0.3, 0.8, 0.4], glow: 0x000000, glowAmt: 0, light: 0.22, rain: 0, clouds: 0.66, exposure: 1.15 },
   streets: { sky: 0x1b242c, horizon: 0x353f46, fog: 0x2e383f, fogDensity: 0.03, ambient: 0x8090a0, ambientI: 0.72,
-    sun: 0xa9b8c8, sunI: 0.5, sunDir: [0.5, 0.6, -0.4], glow: 0x6a5a48, glowAmt: 0.25, light: 0.34, rain: 0.6, exposure: 1.1 },
+    sun: 0xa9b8c8, sunI: 0.5, sunDir: [0.5, 0.6, -0.4], glow: 0x6a5a48, glowAmt: 0.25, light: 0.34, rain: 0.6, clouds: 0.86, exposure: 1.1 },
   dawnStart: { sky: 0x2a3440, horizon: 0x5d5c5a, fog: 0x4a5055, fogDensity: 0.026, ambient: 0x93a0aa, ambientI: 0.8,
-    sun: 0xd9b48c, sunI: 0.6, sunDir: [0.7, 0.22, -0.5], glow: 0xd8935a, glowAmt: 0.7, light: 0.5, rain: 0.25, exposure: 1.05 },
+    sun: 0xd9b48c, sunI: 0.6, sunDir: [0.7, 0.22, -0.5], glow: 0xd8935a, glowAmt: 0.7, light: 0.5, rain: 0.25, clouds: 0.62, exposure: 1.05 },
   dawnEnd: { sky: 0x5f7892, horizon: 0xd0a888, fog: 0x9b9a94, fogDensity: 0.011, ambient: 0xb8bcc0, ambientI: 0.95,
-    sun: 0xffd2a0, sunI: 1.15, sunDir: [0.7, 0.42, -0.5], glow: 0xffb66e, glowAmt: 1.2, light: 0.85, rain: 0, exposure: 1.0 },
+    sun: 0xffd2a0, sunI: 1.15, sunDir: [0.7, 0.42, -0.5], glow: 0xffb66e, glowAmt: 1.2, light: 0.85, rain: 0, clouds: 0.42, exposure: 1.0 },
+  // front-end backdrop (menu-scene.js): first light behind the fortress, thin haze so the walls read at 150 m
+  menu: { sky: 0x173764, horizon: 0xeaa07a, fog: 0x8d8a8f, fogDensity: 0.004, ambient: 0x8a9cb4, ambientI: 0.52,
+    sun: 0xffc690, sunI: 1.65, sunDir: [0.55, 0.2, 0.82], glow: 0xff9a52, glowAmt: 0.6, light: 0.62, rain: 0, clouds: 0.52, exposure: 1.05, horizonPow: 1.7 },
 };
 
 const _col = new THREE.Color(), _col2 = new THREE.Color(), _white = new THREE.Color(1, 1, 1);
@@ -182,6 +262,8 @@ export const R = {
   width: 1, height: 1,
   /** current dynamic-resolution step (index into DYN) and the resulting render-target scale */
   dyn: 0, renderScale: 1,
+  /** bloom settings (tunable from the console) and a 0..1 multiplier; Low has no bloom chain at all */
+  bloomCfg: BLOOM, bloomAmt: 1,
 
   init(canvas) {
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance', stencil: false });
@@ -226,7 +308,8 @@ export const R = {
 
     // sky dome
     this.skyMat = new THREE.ShaderMaterial({ vertexShader: SKY_VS, fragmentShader: SKY_FS, side: THREE.BackSide, depthWrite: false, depthTest: false, fog: false,
-      uniforms: { uTop: { value: new THREE.Color() }, uHorizon: { value: new THREE.Color() }, uGlow: { value: new THREE.Color() }, uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uGlowAmt: { value: 0 } } });
+      uniforms: { uTop: { value: new THREE.Color() }, uHorizon: { value: new THREE.Color() }, uGlow: { value: new THREE.Color() }, uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uGlowAmt: { value: 0 }, uHPow: { value: 0.6 },
+        tCloud: { value: createCloudTexture() }, uCloud: { value: 0 }, uCloudT: { value: 0 }, uCloudCol: { value: new THREE.Color() } } });
     this.sky = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 12), this.skyMat);
     this.sky.frustumCulled = false; this.sky.renderOrder = -10;
     G.scene.add(this.sky);
@@ -235,10 +318,20 @@ export const R = {
     this.postScene = new THREE.Scene();
     this.postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     this.postMat = new THREE.ShaderMaterial({ vertexShader: POST_VS, fragmentShader: POST_FS, depthTest: false, depthWrite: false,
-      uniforms: { tScene: { value: null }, tPrev: { value: null }, uNV: { value: 0 }, uBlur: { value: 0 }, uFlash: { value: 0 }, uDamage: { value: 0 },
+      uniforms: { tScene: { value: null }, tPrev: { value: null }, tBloom: { value: null }, uBloom: { value: 0 }, uBloomTexel: { value: new THREE.Vector2(1, 1) }, uNV: { value: 0 }, uBlur: { value: 0 }, uFlash: { value: 0 }, uDamage: { value: 0 },
         uTime: { value: 0 }, uMotion: { value: 0 }, uDesat: { value: 0 }, uExposure: { value: 1 }, uVignette: { value: 0.25 }, uScope: { value: 0 },
         uSharp: { value: 0.3 }, uSat: { value: 1.12 }, uTexel: { value: new THREE.Vector2(1, 1) }, uTint: { value: new THREE.Color(1, 1, 1) } } });
     this.postScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.postMat));
+    // bloom chain: one full-screen triangle pair, two materials (overwrite / additive)
+    const bu = () => ({ tSrc: { value: null }, uTexel: { value: new THREE.Vector2(1, 1) }, uBright: { value: 0 }, uExposure: { value: 1 }, uWeight: { value: 1 },
+      uClamp: { value: BLOOM.clamp }, uCurve: { value: new THREE.Vector4() } });
+    this.bloomMat = new THREE.ShaderMaterial({ vertexShader: POST_VS, fragmentShader: BLOOM_FS, depthTest: false, depthWrite: false, uniforms: bu() });
+    this.bloomAddMat = new THREE.ShaderMaterial({ vertexShader: POST_VS, fragmentShader: BLOOM_FS, depthTest: false, depthWrite: false, uniforms: bu(),
+      blending: THREE.AdditiveBlending });
+    this.bloomQuad = new THREE.Mesh(this.postScene.children[0].geometry, this.bloomMat);
+    this.bloomQuad.frustumCulled = false;
+    this.bloomScene = new THREE.Scene(); this.bloomScene.add(this.bloomQuad);
+    this.bloomRT = [];
 
     this._buildRain();
     const tier = this.isAuto() ? this.detectTier() : G.settings.quality;
@@ -248,6 +341,9 @@ export const R = {
     window.addEventListener('resize', () => this.resize());
     this.resize();
   },
+
+  /** Extra cap on the pixel ratio (the menu backdrop keeps laptops cool with 1.5); 0 clears it. */
+  setDprCap(v) { if ((this.dprCap || 0) !== (v || 0)) { this.dprCap = v || 0; this.resize(); } },
 
   /** No explicit choice in Settings yet (or "Auto" picked): the tier is chosen and adjusted by the game. */
   isAuto() { return !G.settings || G.settings.qualityAuto !== false; },
@@ -298,7 +394,7 @@ export const R = {
 
   resize() {
     const w = window.innerWidth, h = window.innerHeight;
-    const dpr = Math.min(window.devicePixelRatio || 1, this.q.dpr);
+    const dpr = Math.min(window.devicePixelRatio || 1, this.q.dpr, this.dprCap || 99);
     this.width = w; this.height = h;
     this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(w, h, false);
@@ -312,12 +408,48 @@ export const R = {
     const cw = this.renderer.domElement.width, ch = this.renderer.domElement.height;
     this.renderScale = this.q.scale * DYN[this.dyn];
     const pw = Math.max(2, Math.floor(cw * this.renderScale)), ph = Math.max(2, Math.floor(ch * this.renderScale));
+    this._allocBloom(pw, ph);
     if (this.rtA && this.rtA.width === pw && this.rtA.height === ph) return;
     for (const k of ['rtA', 'rtB']) { if (this[k]) this[k].dispose(); }
     const opts = { samples: this.msaaOK ? this.q.samples : 0, depthBuffer: true, type: THREE.HalfFloatType };
     this.rtA = new THREE.WebGLRenderTarget(pw, ph, opts);
     this.rtB = new THREE.WebGLRenderTarget(pw, ph, opts);
     this.postMat.uniforms.uTexel.value.set(1 / pw, 1 / ph);
+  },
+
+  /** Bloom chain at 1/4, 1/8, 1/16 of the scene target; rebuilt when that size or the tier's bloom switch changes. */
+  _allocBloom(pw, ph) {
+    const key = this.q.bloom ? pw + 'x' + ph : '';
+    if (key === this._bloomKey) return;
+    this._bloomKey = key;
+    for (const t of this.bloomRT) t.dispose();
+    this.bloomRT = [];
+    if (!key) return;
+    for (const d of [4, 8, 16]) {
+      this.bloomRT.push(new THREE.WebGLRenderTarget(Math.max(1, Math.round(pw / d)), Math.max(1, Math.round(ph / d)),
+        { type: THREE.HalfFloatType, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false }));
+    }
+    const q = this.bloomRT[0];
+    this.postMat.uniforms.uBloomTexel.value.set(1 / q.width, 1 / q.height);
+  },
+
+  /** Bright pass + down/up chain from the scene texture; leaves the result in bloomRT[0]. */
+  _bloom(src, srcW, srcH) {
+    const r = this.renderer, [q4, q8, q16] = this.bloomRT, B = this.bloomCfg;
+    const pass = (mat, from, fw, fh, to, bright, weight) => {
+      const u = mat.uniforms;
+      u.tSrc.value = from; u.uTexel.value.set(1 / fw, 1 / fh); u.uBright.value = bright; u.uWeight.value = weight;
+      this.bloomQuad.material = mat;
+      r.setRenderTarget(to); r.render(this.bloomScene, this.postCam);
+    };
+    const bu = this.bloomMat.uniforms;
+    bu.uExposure.value = this.exposure || 1; bu.uClamp.value = B.clamp;
+    bu.uCurve.value.set(B.threshold, B.threshold - B.knee, 2 * B.knee, 0.25 / B.knee);
+    pass(this.bloomMat, src, srcW, srcH, q4, 1, B.wQuarter);
+    pass(this.bloomMat, q4.texture, q4.width, q4.height, q8, 0, B.wEighth / B.wQuarter);
+    pass(this.bloomMat, q8.texture, q8.width, q8.height, q16, 0, B.wSixteenth / B.wEighth);
+    pass(this.bloomAddMat, q16.texture, q16.width, q16.height, q8, 0, 1);
+    pass(this.bloomAddMat, q8.texture, q8.width, q8.height, q4, 0, 1);
   },
 
   /**
@@ -360,6 +492,7 @@ export const R = {
     this.skyMat.uniforms.uHorizon.value.copy(mixC('horizon'));
     this.skyMat.uniforms.uGlow.value.copy(mixC('glow'));
     this.skyMat.uniforms.uGlowAmt.value = lerp(A.glowAmt, B.glowAmt, t);
+    this.skyMat.uniforms.uHPow.value = lerp(A.horizonPow ?? 0.6, B.horizonPow ?? 0.6, t);     // higher: a narrower horizon band
     const d = [0, 1, 2].map((i) => lerp(A.sunDir[i], B.sunDir[i], t));
     this.sunDir = new THREE.Vector3(d[0], d[1], d[2]).normalize();
     this.skyMat.uniforms.uSunDir.value.copy(this.sunDir);
@@ -379,6 +512,10 @@ export const R = {
     this.rainAmt = lerp(A.rain, B.rain, t);
     setWetness(clamp01(this.rainAmt * 1.7));
     this.exposure = lerp(A.exposure, B.exposure, t);
+    // clouds: amount per preset; their underside is the zenith tinted toward the horizon, plus a little moon/sun light
+    const su = this.skyMat.uniforms;
+    su.uCloud.value = lerp(A.clouds ?? 0, B.clouds ?? 0, t);
+    su.uCloudCol.value.copy(su.uTop.value).lerp(su.uHorizon.value, 0.3).multiplyScalar(1.2).add(_col2.copy(this.sun.color).multiplyScalar(0.07 * this.lightLevel));
     this.env = { A, B, t };
   },
 
@@ -408,9 +545,11 @@ export const R = {
     G.scene.add(this.rain);
   },
 
-  update(dt, time) {
-    const cam = G.camera.position;
-    this.sky.position.copy(cam); this.sky.scale.setScalar(G.camera.far * 0.9);
+  /** `camera` (optional): the camera the frame is drawn with when it is not G.camera (the menu backdrop). */
+  update(dt, time, camera) {
+    const view = camera || G.camera, cam = view.position;
+    this.sky.position.copy(cam); this.sky.scale.setScalar(view.far * 0.9);
+    this.skyMat.uniforms.uCloudT.value = time % 20000;
     // sun follows the player so its shadow frustum stays centred; the centre is snapped to
     // whole shadow texels in light space so shadow edges do not shimmer as the player moves
     const sd = this.sunDir || UP;
@@ -424,9 +563,14 @@ export const R = {
     this.sun.target.position.copy(_p);
     this.sun.position.copy(_p).addScaledVector(sd, 70);
 
-    // rain: recycle streaks inside a box around the camera
+    // rain: recycle streaks inside a box around the camera; none while the camera is inside a house
+    // (checked five times a second on wall-clock time, so it also settles while the game is paused)
+    if (!(Math.abs(time - (this._indoorT ?? -1e9)) < 0.2)) {
+      this._indoorT = time;
+      this._indoor = !!(G.level && G.level.isIndoor(cam.x, cam.y, cam.z));
+    }
     const amt = this.rainAmt || 0;
-    this.rain.visible = amt > 0.02;
+    this.rain.visible = amt > 0.02 && !this._indoor;
     if (this.rain.visible) {
       const n = Math.floor(this.q.rain * amt), p = this.rain.geometry.attributes.position.array, sdd = this.rainSeed;
       const box = 26, hgt = 16, fall = time * 17;
@@ -473,6 +617,10 @@ export const R = {
       r.clearDepth();
       r.render(G.vmScene, G.vmCamera);
     }
+    const bloomOn = this.bloomRT.length && this.bloomAmt !== 0;
+    if (bloomOn) this._bloom(cur.texture, cur.width, cur.height);
+    u.tBloom.value = bloomOn ? this.bloomRT[0].texture : null;
+    u.uBloom.value = bloomOn ? this.bloomCfg.strength * this.bloomAmt : 0;
     r.setRenderTarget(null);
     u.tScene.value = cur.texture; u.tPrev.value = prev.texture;
     u.uNV.value = p.nv; u.uBlur.value = p.blur; u.uFlash.value = clamp01(p.flash); u.uDamage.value = clamp01(p.damage);

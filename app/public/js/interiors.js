@@ -20,8 +20,9 @@ import * as THREE from 'three';
 import { G, makeRng, dist2D, angDelta, yawTo } from './ctx.js';
 import { Geo } from './models.js';
 import { C, buildProp } from './structures.js';
-import { TEX_SCALE } from './textures.js';
+import { TEX_SCALE, TEX, TEX_NORMAL, TEX_ORM, interiorTextures } from './textures.js';
 import { worldMaterial } from './materials.js';
+import { Emit, drawPiece, carpet } from './furnishings.js';
 import { NOISE, STEALTH } from './config.js';
 import { noise } from './noise.js';
 import { audio } from './audio.js';
@@ -121,6 +122,69 @@ function SB(L, name) {
   if (!g) { g = new Geo({ uv: true }); m.set(name, g); }
   return g;
 }
+/** One of a house's own interior batches (finalizeInteriors makes them a group per house, culled with distance). */
+function IB(H, name) {
+  let g = H.map.get(name);
+  if (!g) { g = new Geo({ uv: true }); H.map.set(name, g); }
+  return g;
+}
+
+// ───────────────────────────── interior batches ─────────────────────────────
+/** Furnishings are hidden beyond this distance (you cannot make them out from further off anyway). */
+const IN_CULL = 60;
+/**
+ * Build every house's interior batches into meshes (called from Level.finalize): wallpaper, floorboards,
+ * carpets and pictures, veneer, enamel and upholstery, one group per house. They cast no shadows.
+ */
+export function finalizeInteriors(L) {
+  if (!L._inHouses || !L._inHouses.length) return;
+  // floors and wallpaper are the rooms' surfaces (the walls' own room faces are not drawn): one batch each
+  // for the level, never hidden, and wallpapered walls keep the sun out
+  const T = interiorTextures(), t0 = performance.now();
+  const std = (o) => new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0, ...o });
+  const cloth = TEX.cloth && !TEX.cloth.userData.file;
+  const M = {
+    in_floor: std({ map: T.floor.map, normalMap: T.floor.normal, roughnessMap: T.floor.rough, normalScale: new THREE.Vector2(0.8, 0.8), envMapIntensity: 0.5 }),
+    in_paper: std({ map: T.paper.map, normalMap: T.paper.normal, roughnessMap: T.paper.rough, normalScale: new THREE.Vector2(0.6, 0.6), envMapIntensity: 0.3 }),
+    in_carpet: std({ map: T.carpet, roughness: 1, envMapIntensity: 0.2 }),
+    in_veneer: std({ map: T.veneer.map, normalMap: T.veneer.normal, roughnessMap: T.veneer.rough, normalScale: new THREE.Vector2(0.5, 0.5), envMapIntensity: 0.7 }),
+    in_enamel: std({ roughness: 0.34, envMapIntensity: 0.8 }),
+    // upholstery keeps the cloth weave's relief but not its khaki colour: the pieces carry their own colours
+    in_fabric: std({ normalMap: cloth ? TEX_NORMAL.cloth : null, roughnessMap: cloth ? TEX_ORM.cloth : null, side: THREE.DoubleSide, envMapIntensity: 0.3 }),
+  };
+  L._inMats = M;
+  L._inGroups = [];
+  if (L._inShell) for (const [name, g] of L._inShell.map) {
+    if (!g.count) continue;
+    const mesh = new THREE.Mesh(g.build(), M[name]);
+    mesh.castShadow = name === 'in_paper'; mesh.receiveShadow = true; mesh.name = name;
+    L.group.add(mesh);
+  }
+  // the furnishings: a group per house, no shadows, hidden with distance
+  for (const H of L._inHouses) {
+    const grp = new THREE.Group();
+    grp.name = 'interior';
+    for (const [name, g] of H.map) {
+      if (!g.count) continue;
+      const mesh = new THREE.Mesh(g.build(), M[name]);
+      mesh.castShadow = false; mesh.receiveShadow = true; mesh.name = name;
+      grp.add(mesh);
+    }
+    grp.userData = { x: H.x, z: H.z, r: H.r };
+    L.group.add(grp);
+    L._inGroups.push(grp);
+  }
+  // triangles per kind of piece (and 'rooms' for the finishes, 'windows' for radiators and curtains), for tuning
+  L.interiorStats = { texMs: T.ms, ms: performance.now() - t0, tris: L._inTris || {} };
+  delete L._inTris;
+}
+/** Show only the interiors near the camera (every frame from DoorSystem.update). */
+function cullInteriors(L) {
+  const cam = G.camera, gs = L._inGroups;
+  if (!cam || !gs) return;
+  const cx = cam.position.x, cz = cam.position.z;
+  for (const g of gs) { const u = g.userData, d = Math.hypot(cx - u.x, cz - u.z) - u.r; g.visible = d < IN_CULL; }
+}
 
 // ───────────────────────────── the house ─────────────────────────────
 /**
@@ -133,17 +197,21 @@ export function buildTownhouse(L, x, z, w, d, o = {}) {
     roof: o.roof, garrison: o.garrison, low: o.low, balcony: o.balcony, lit: o.lit, seed: o.seed });
   for (const b of pl.boxes) L.world.addBox(b);
   for (const v of pl.indoor) L.indoor.push(v);
-  const rng = makeRng((Math.floor(x * 7.31 + 1000) * 73856093) ^ (Math.floor(z * 5.17 + 1000) * 19349663) ^ 0x1ab);
+  const seed = (Math.floor(x * 7.31 + 1000) * 73856093) ^ (Math.floor(z * 5.17 + 1000) * 19349663);
+  const rng = makeRng(seed ^ 0x1ab);
   const tex = o.wall || 'stone', isStone = tex === 'stone';
+  const H = { map: new Map(), x, z, r: Math.hypot(w, d) / 2 };
+  (L._inHouses || (L._inHouses = [])).push(H);
   const K = {
     wall: L._batch(tex), stone: L._batch('stone'), plaster: L._batch('plaster'), wood: L._batch('wood'), roof: L._batch('roof'), conc: L._batch('concrete'),
     cloth: L._batch('cloth'), dark: L._batch('dark'), glow: L._batch('glow'),
-    pwood: SB(L, 'st_pwood'), paint: SB(L, 'st_paint'), metal: SB(L, 'st_metal'), glass: SB(L, 'st_glass'),
+    pwood: SB(L, 'st_pwood'), paint: SB(L, 'st_paint'), metal: SB(L, 'st_metal'), glass: SB(L, 'st_glass'), cglass: SB(L, 'st_cglass'),
+    floor: IB(L._inShell || (L._inShell = { map: new Map() }), 'in_floor'), paper: IB(L._inShell, 'in_paper'), car: IB(H, 'in_carpet'), ven: IB(H, 'in_veneer'), ena: IB(H, 'in_enamel'), fab: IB(H, 'in_fabric'),
   };
   const st = {
     tex, isStone, us: TEX_SCALE[tex] || 2.6, wallCol: C(o.tint ?? 0xffffff), trim: C(isStone ? 0xe8e2d4 : 0xe4ddcf), plinth: C(isStone ? 0xa29c90 : 0xaaa496),
     frame: C(rng.pick(FRAME_COLS)), shut: C(rng.pick(SHUT_COLS)), quoins: isStone && rng.chance(0.7),
-    rooms: [0, 1, 2].map(() => C(rng.pick(ROOM_COLS))), floorWood: C(rng.pick([0x8a7a66, 0x7a6a58, 0x9a8670])),
+    rooms: [0, 1, 2].map(() => C(rng.pick(ROOM_COLS))), floorWood: C(rng.pick([0x8a7a66, 0x7a6a58, 0x9a8670])), seed: seed >>> 0,
   };
   const fr = new Frame(x, z, pl.R);
   drawShell(L, pl, K, st, fr, rng);
@@ -221,7 +289,8 @@ function drawShell(L, pl, K, st, fr, rng) {
     const iSpan = ends ? [-pl.ia, pl.ia] : [-S.len / 2 + Tout, S.len / 2 - Tout];
     for (let f = 0; f < floors; f++) {
       const ya = f === 0 ? y0 : fy[f], yb = f + 1 < floors ? fy[f + 1] : top;
-      for (const r of solidRects(iSpan[0], iSpan[1], ya, yb, holes)) sideBox(fr, K.plaster, S, r.u0, r.u1, Tout, T, r.y0, r.y1, st.rooms[f % 3], { skip: out, us: 3.2, k: KIN, kb: 0.8 });
+      // (the face towards the room is the room's own finish, drawn in drawInside)
+      for (const r of solidRects(iSpan[0], iSpan[1], ya, yb, holes)) sideBox(fr, K.plaster, S, r.u0, r.u1, Tout, T, r.y0, r.y1, st.rooms[f % 3], { skip: out | inn, us: 3.2, k: KIN, kb: 0.8 });
     }
     if (flat) for (const r of solidRects(iSpan[0], iSpan[1], top, wallTop, holes)) sideBox(fr, K.wall, S, r.u0, r.u1, Tout, T, r.y0, r.y1, mul(st.wallCol, 0.8), { skip: out | 8, us: st.us });
     // plinth, proud of the wall, broken by the door
@@ -338,46 +407,72 @@ function dressDoor(fr, K, st, pl, S, D, out, inn) {
 }
 
 // ───────────────────────────── inside ─────────────────────────────
+const RY_OF_WALL = [PI / 2, -PI / 2, 0, PI];
+const CEIL = C(0xeeebe2);           // whitewashed ceilings
+const fall = (d, r) => (d >= r ? 0 : (1 - d / r) * (1 - d / r));
+const WARM = [1.07, 1.0, 0.88];
+const CURTAINS = [0x7a2a26, 0x6a6a3a, 0xa8883a, 0x2e5a5a, 0xd8c8a0, 0xa86a6a, 0x6a4a30, 0x8a9aa8];
+const SKIRT = [0x4a3a2c, 0x5a3e2a, 0x3e3430, 0x6a5a48];
+const FLOOR_PAINT = [0x9a4a36, 0x8a4a3a, 0x7a4632, 0xa0583e];
+const FLOOR_WOOD = [0xe0c8a8, 0xd0b896, 0xe8d4b4];
+/** knock a few edge breaks into [lo, hi]: the ends, a band at each end, and steps no longer than `step` */
+function breaks(lo, hi, band, step) {
+  const out = [lo];
+  if (hi - lo > 2 * band + 0.05) {
+    out.push(lo + band);
+    const n = Math.max(1, Math.ceil((hi - lo - 2 * band) / step));
+    for (let i = 1; i < n; i++) out.push(lo + band + (hi - lo - 2 * band) * i / n);
+    out.push(hi - band);
+  } else if (hi - lo > 0.4) out.push((lo + hi) / 2);
+  out.push(hi);
+  return out;
+}
+
+/** Every opening on floor f: centre on its wall line, width, heights, which way the wall runs. */
+function openingsOn(pl, f) {
+  const out = [];
+  for (const wl of pl.walls) for (const g of wl.gaps) {
+    const pa = wl.axis === 'b' ? wl.at : g.c, pb = wl.axis === 'b' ? g.c : wl.at, y0 = pl.floorAt(f, pa, pb);
+    out.push({ axis: wl.axis, pa, pb, w: g.w, y0, y1: y0 + DIM.doorH, kind: 'gap' });
+  }
+  for (const S of pl.SIDES) {
+    const axis = Math.abs(S.t[0]) > 0.5 ? 'a' : 'b';
+    if (f === 0 && S.door) out.push({ axis, pa: S.o[0] + S.t[0] * S.door.u, pb: S.o[1] + S.t[1] * S.door.u, w: S.door.w, y0: S.door.g, y1: S.door.g + DIM.doorH + 0.05, kind: 'door' });
+    for (const W of pl.windows) if (W.f === f && W.side === S.key) out.push({ axis, pa: S.o[0] + S.t[0] * W.u, pb: S.o[1] + S.t[1] * W.u, w: W.ww, y0: W.ya, y1: W.yb, kind: 'win', W });
+  }
+  return out;
+}
+
 function drawInside(L, pl, K, st, fr, rng) {
-  const { floors, fy, top, slab, ia, ib, ti } = pl;
-  // interior walls with skirting and door frames
+  const { floors, fy, top, slab, ia, ib, ti, T } = pl;
+  const irng = makeRng((st.seed ^ 0x51f3a7) >>> 0);
+  const ceilY = (f) => (f + 1 < floors ? fy[f + 1] : top) - slab;
+  // interior walls: what the rooms' finishes do not cover — ends, tops, the lintels' undersides
   for (let f = 0; f < floors; f++) {
     const yTopF = (f + 1 < floors ? fy[f + 1] : top) - slab, col = st.rooms[(f + 1) % 3];
     for (const wl of pl.walls) {
-      const along = wl.axis === 'a';
+      const along = wl.axis === 'a', skipF = 8 | (along ? 16 | 32 : 1 | 2);
       const at = (s0) => (along ? [s0, wl.at] : [wl.at, s0]);
       const yb0 = f === 0 ? Math.min(pl.gyC(...at(wl.from)), pl.gyC(...at(wl.to))) - 0.25 : fy[f];
-      const seg = (s0, s1, ya, yb, skirt) => {
+      const seg = (s0, s1, ya, yb) => {
         if (s1 - s0 < 1e-3 || yb - ya < 1e-3) return;
-        const m = (s0 + s1) / 2, p = at(m);
-        fr.box(K.plaster, p[0], (ya + yb) / 2, p[1], along ? s1 - s0 : ti, yb - ya, along ? ti : s1 - s0, col, { us: 3.2, k: KIN, kb: 0.8, skip: 8 });
-        if (skirt) { const gy0 = f === 0 ? pl.gyC(...p) : fy[f]; fr.box(K.pwood, p[0], gy0 + 0.06, p[1], along ? s1 - s0 : ti + 0.03, 0.12, along ? ti + 0.03 : s1 - s0, C(0x4a3a2c), { us: 0.9, k: KIN, skip: 8 }); }
+        const p = at((s0 + s1) / 2);
+        fr.box(K.plaster, p[0], (ya + yb) / 2, p[1], along ? s1 - s0 : ti, yb - ya, along ? ti : s1 - s0, col, { us: 3.2, k: KIN, kb: 0.8, skip: skipF });
       };
       const gs = wl.gaps.slice().sort((p, q) => p.c - q.c);
       let from = wl.from;
       for (const g of gs) {
         const gb = f === 0 ? pl.gyC(...at(g.c)) : fy[f];
-        seg(from, g.c - g.w / 2, yb0, yTopF, true);
-        seg(g.c - g.w / 2, g.c + g.w / 2, gb + DIM.doorH, yTopF, false);
-        // architrave both sides, lining
+        seg(from, g.c - g.w / 2, yb0, yTopF);
+        seg(g.c - g.w / 2, g.c + g.w / 2, gb + DIM.doorH, yTopF);
         for (const e of [g.c - g.w / 2 - 0.04, g.c + g.w / 2 + 0.04]) { const p = at(e); fr.box(K.pwood, p[0], gb + DIM.doorH / 2 + 0.03, p[1], along ? 0.08 : ti + 0.04, DIM.doorH + 0.06, along ? ti + 0.04 : 0.08, st.frame, { us: 0.9, k: KIN, skip: 8 }); }
         { const p = at(g.c); fr.box(K.pwood, p[0], gb + DIM.doorH + 0.04, p[1], along ? g.w + 0.16 : ti + 0.04, 0.08, along ? ti + 0.04 : g.w + 0.16, st.frame, { us: 0.9, k: KIN }); }
         from = g.c + g.w / 2;
       }
-      seg(from, wl.to, yb0, yTopF, true);
+      seg(from, wl.to, yb0, yTopF);
     }
   }
-  // ground floor: planks over the (gently sloping) ground
-  {
-    const nx = Math.max(2, Math.round(ia * 2 / 1.6)), nz = Math.max(2, Math.round(ib * 2 / 1.6)), g = K.wood, base = g.count;
-    for (let j = 0; j <= nz; j++) for (let i = 0; i <= nx; i++) {
-      const a = -ia + (i / nx) * 2 * ia, b = -ib + (j / nz) * 2 * ib;
-      const edge = i === 0 || j === 0 || i === nx || j === nz;
-      fr._v(g, a, pl.gyC(a, b) + 0.025, b, 0, 1, 0, st.floorWood, KIN * (edge ? 0.7 : 1), a / 1.8, b / 1.8);
-    }
-    for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) { const q = base + j * (nx + 1) + i; g.i.push(q, q + nx + 1, q + 1, q + 1, q + nx + 1, q + nx + 2); }
-  }
-  // upper floors: plank tops, plaster undersides, the stairwell cut out
+  // ceilings: plaster undersides of the slabs and the roof
   const slabBoxes = (f) => {
     const h = pl.holes.find((q) => q.f === f);
     if (!h) return [[0, 0, ia, ib]];
@@ -386,28 +481,267 @@ function drawInside(L, pl, K, st, fr, rng) {
   };
   for (let f = 1; f < floors; f++) for (const [a, b, ha, hb] of slabBoxes(f)) {
     if (ha < 1e-3 || hb < 1e-3) continue;
-    fr.box(K.wood, a, fy[f] - 0.01, b, ha * 2, 0.02, hb * 2, st.floorWood, { us: 1.8, k: KIN, skip: 1 | 2 | 8 | 16 | 32 });
-    fr.box(K.plaster, a, fy[f] - slab / 2 - 0.01, b, ha * 2, slab - 0.02, hb * 2, st.rooms[(f + 2) % 3], { us: 3.2, k: KIN * 0.9, skip: 4 });
+    fr.box(K.plaster, a, fy[f] - slab / 2 - 0.01, b, ha * 2, slab - 0.02, hb * 2, CEIL, { us: 3.2, k: KIN * 0.9, skip: 4 });
   }
-  fr.box(K.plaster, 0, top - slab / 2, 0, ia * 2, slab, ib * 2, st.rooms[2], { us: 3.2, k: KIN * 0.85, skip: 4 | 1 | 2 | 16 | 32 });
+  fr.box(K.plaster, 0, top - slab / 2, 0, ia * 2, slab, ib * 2, CEIL, { us: 3.2, k: KIN * 0.9, skip: 4 | 1 | 2 | 16 | 32 });
   if (pl.flat) {
     fr.box(K.conc, 0, top + 0.006, 0, ia * 2, 0.012, ib * 2, C(0x5e5e5a), { us: 3, skip: 8 | 1 | 2 | 16 | 32 });
     for (let k = 0; k < 4; k++) { const pw = rng.range(1, 3), pd = rng.range(0.8, 2.4); fr.box(K.conc, rng.range(-ia + pw / 2, ia - pw / 2), top + 0.014, rng.range(-ib + pd / 2, ib - pd / 2), pw, 0.004, pd, C(rng.pick([0x4a4a48, 0x6e6c66])), { us: 3, skip: 8 }); }
     fr.box(K.paint, rng.range(-0.3, 0.3) * ia, top + 0.03, rng.range(-0.3, 0.3) * ib, 0.8, 0.04, 0.8, C(0x5a5e58), { us: 1.6 });
   }
-  // a runner down the hall
-  if (pl.hallL) fr.box(K.cloth, pl.ah, pl.gyC(pl.ah, 0) + 0.04, 0, 1.0, 0.01, ib * 2 - 2.4, mul(C(rng.pick(CLOTH_COLS)), KIN), { us: 1.2, skip: 8 });
   // stairs
   for (const fl of pl.flights) drawFlight(fr, K, st, pl, fl);
   for (const rl of pl.rails) drawRail(fr, K, st, pl, rl);
-  // furniture
-  for (const it of pl.furn) drawItem(L, fr, K, st, pl, it, rng);
-  // lamps you can see burning
+
+  // ── every room and hall: wall finish, skirting, coving, floorboards, a ceiling light
+  const tk = L._inTris || (L._inTris = {}), tri0 = triCount(K) + K.paper.i.length / 3 + K.plaster.i.length / 3;
+  const spaces = pl.roomsF.concat(pl.halls), ops = [];
+  for (let f = 0; f < floors; f++) ops.push(openingsOn(pl, f));
+  const skirtCol = C(irng.pick(SKIRT)), curtainCol = C(irng.pick(CURTAINS)), curtainCol2 = C(irng.pick(CURTAINS));
+  const unitPainted = irng.chance(0.65), unit = unitPainted ? C(irng.pick([0xe8e2d0, 0xd8dcc8, 0xc8d8d0, 0xe4d8b8, 0xd0d8e0])) : C(irng.pick([0xc89a74, 0xb08060, 0xd4ae86]));
+  const floorCol = new Map();
+  for (const sp of spaces) {
+    const s = sp.style, f = sp.f, yTop = ceilY(f);
+    const fY = (a, b) => (f === 0 ? pl.gyC(a, b) + 0.025 : fy[f]);
+    const warm = sp.lit ? WARM : [1, 1, 1];
+    const tintK = (col, kk) => [col[0] * kk * warm[0], col[1] * kk * warm[1], col[2] * kk * warm[2]];
+    const fcol = C(s.floor === 'paint' ? FLOOR_PAINT[(sp.id + 7 * f + 4) & 3] : FLOOR_WOOD[(sp.id + f) % 3]);
+    floorCol.set(f + ':' + sp.id, { fcol, fY, sp });
+    const aoF = (a, b) => (1 - 0.34 * fall(a - sp.a0, 0.5)) * (1 - 0.34 * fall(sp.a1 - a, 0.5)) * (1 - 0.34 * fall(b - sp.b0, 0.5)) * (1 - 0.34 * fall(sp.b1 - b, 0.5));
+    // floorboards (round the stairwell), shaded into the corners
+    const holes = pl.holes.filter((h) => h.f === f).map((h) => ({ u0: h.a0, u1: h.a1, y0: h.b0, y1: h.b1 }));
+    for (const r of solidRects(sp.a0, sp.a1, sp.b0, sp.b1, holes)) {
+      const as = breaks(r.u0, r.u1, 0.45, f === 0 ? 1.0 : 2.2), bs = breaks(r.y0, r.y1, 0.45, f === 0 ? 1.0 : 2.2), g = K.floor, base = g.count, nx = as.length - 1;
+      for (const b of bs) for (const a of as) fr._v(g, a, fY(a, b), b, 0, 1, 0, tintK(fcol, KIN), aoF(a, b), a / 2.4, b / 2.4);
+      for (let j = 0; j < bs.length - 1; j++) for (let i = 0; i < nx; i++) { const q = base + j * (nx + 1) + i; g.i.push(q, q + nx + 1, q + 1, q + 1, q + nx + 1, q + nx + 2); }
+    }
+    // the four walls
+    const fRef = fY((sp.a0 + sp.a1) / 2, (sp.b0 + sp.b1) / 2), yD = fRef + s.dadoH;
+    for (let k = 0; k < 4; k++) {
+      const along = k < 2 ? 'b' : 'a', at = k === 0 ? sp.a0 : k === 1 ? sp.a1 : k === 2 ? sp.b0 : sp.b1, s0 = k < 2 ? sp.b0 : sp.a0, s1 = k < 2 ? sp.b1 : sp.a1;
+      const n = k === 0 ? [1, 0, 0] : k === 1 ? [-1, 0, 0] : k === 2 ? [0, 0, 1] : [0, 0, -1], flip = k === 0 || k === 3;
+      const P = (sv) => (along === 'b' ? [at, sv] : [sv, at]);
+      const fl = (sv) => { const p = P(sv); return fY(p[0], p[1]); };
+      const mine = ops[f].filter((q) => q.axis === along && Math.abs((along === 'b' ? q.pa : q.pb) - at) < T + 0.06).map((q) => ({ ...q, s: along === 'b' ? q.pb : q.pa })).filter((q) => q.s > s0 - 0.05 && q.s < s1 + 0.05);
+      const yLow = Math.min(fl(s0), fl(s1)) - 0.05;
+      const holesW = mine.map((q) => ({ u0: q.s - q.w / 2, u1: q.s + q.w / 2, y0: q.kind === 'win' ? q.y0 : yLow - 1, y1: q.y1 }));
+      const aoW = (sv, y) => (1 - 0.4 * fall(y - fl(sv), 0.32)) * (1 - 0.24 * fall(yTop - y, 0.3));
+      const panel = (g, ya, yb, col, us) => {
+        for (const r of solidRects(s0, s1, ya, yb, holesW)) {
+          const ss = [r.u0];
+          const nmid = f === 0 ? Math.ceil((r.u1 - r.u0) / 2.0) : 1;
+          for (let i = 1; i < nmid; i++) ss.push(r.u0 + (r.u1 - r.u0) * i / nmid);
+          ss.push(r.u1); ss.sort((p, q) => p - q);
+          const bottom = r.y0 <= yLow + 1e-3, topC = r.y1 >= yTop - 1e-3, fMax = Math.max(fl(r.u0), fl(r.u1));
+          const rows = (sv) => {
+            const out = [bottom ? fl(sv) - 0.004 : r.y0];
+            if (bottom && r.y1 - fMax > 0.45) out.push(fl(sv) + 0.3);
+            if (topC && r.y1 - Math.max(r.y0, fMax) > 0.75) out.push(yTop - 0.3);
+            out.push(r.y1);
+            return out;
+          };
+          const base = g.count, nr = rows(ss[0]).length;
+          for (const sv of ss) for (const y of rows(sv)) { const p = P(sv); fr._v(g, p[0], y, p[1], n[0], n[1], n[2], col, aoW(sv, y), sv / us, y / us); }
+          for (let i = 0; i < ss.length - 1; i++) for (let j = 0; j < nr - 1; j++) {
+            const a = base + i * nr + j, b = a + nr, c2 = b + 1, d = a + 1;
+            if (flip) g.i.push(a, d, c2, a, c2, b); else g.i.push(a, b, c2, a, c2, d);
+          }
+        }
+      };
+      if (s.paper) panel(K.paper, yLow, yTop, tintK(C(s.wall), KIN), 0.56);
+      else {
+        panel(K.plaster, yLow, yD, tintK(C(s.dado), KIN * 0.95), 3.2);
+        panel(K.plaster, yD, yTop, tintK(C(s.wall), KIN), 3.2);
+        // the painted line along the top of the dado
+        for (const r of solidRects(s0, s1, yD - 0.01, yD + 0.01, holesW)) {
+          const p0 = P(r.u0), p1 = P(r.u1), o = 0.002, g = K.plaster, base = g.count, col = tintK(C(s.dado), KIN * 0.55);
+          for (const [p, y] of [[p0, yD - 0.01], [p1, yD - 0.01], [p1, yD + 0.01], [p0, yD + 0.01]]) fr._v(g, p[0] + n[0] * o, y, p[1] + n[2] * o, n[0], 0, n[2], col, 1, 0, 0);
+          if (flip) g.i.push(base, base + 2, base + 1, base, base + 3, base + 2); else g.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+        }
+      }
+      // skirting (broken at doorways), coving under the ceiling
+      const lowOps = mine.filter((q) => q.y0 - fl(q.s) < 0.15).map((q) => ({ u0: q.s - q.w / 2, u1: q.s + q.w / 2, y0: -1, y1: 1 }));
+      for (const r of solidRects(s0, s1, 0, 0.5, lowOps)) {
+        const g = K.ven, dep = 0.018, hh = 0.1, col = mul(skirtCol, KIN);
+        const q = (pts, nn) => { const base = g.count; for (const [sv, y, dd] of pts) { const p = P(sv); fr._v(g, p[0] + n[0] * dd, y, p[1] + n[2] * dd, nn[0], nn[1], nn[2], col, y < fl(sv) + 0.02 ? 0.7 : 1, sv / 0.9, y / 0.9); } if (flip) g.i.push(base, base + 3, base + 2, base, base + 2, base + 1); else g.i.push(base, base + 1, base + 2, base, base + 2, base + 3); };
+        q([[r.u0, fl(r.u0) - 0.01, dep], [r.u1, fl(r.u1) - 0.01, dep], [r.u1, fl(r.u1) + hh, dep], [r.u0, fl(r.u0) + hh, dep]], n);
+        q([[r.u0, fl(r.u0) + hh, dep], [r.u1, fl(r.u1) + hh, dep], [r.u1, fl(r.u1) + hh, 0], [r.u0, fl(r.u0) + hh, 0]], [0, 1, 0]);
+      }
+      {
+        const g = K.plaster, base = g.count, cv = 0.075, col = tintK(C(0xf0ece2), KIN * 0.92), nn = [n[0] * 0.7, -0.7, n[2] * 0.7];
+        const pA = P(s0), pB = P(s1);
+        for (const [p, y, dd] of [[pA, yTop - cv, 0], [pB, yTop - cv, 0], [pB, yTop, cv], [pA, yTop, cv]]) fr._v(g, p[0] + n[0] * dd, y, p[1] + n[2] * dd, nn[0], nn[1], nn[2], col, y < yTop - 0.01 ? 0.92 : 0.8, 0, 0);
+        if (flip) g.i.push(base, base + 3, base + 2, base, base + 2, base + 1); else g.i.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      }
+    }
+    // the ceiling light: enamel shade on a flex, a three-armed chandelier, or a glass dome
+    {
+      let ca = (sp.a0 + sp.a1) / 2, cb = (sp.b0 + sp.b1) / 2;
+      if (sp.hall) {
+        const busy = (b) => pl.holes.some((h) => (h.f === f || h.f === f + 1) && b > h.b0 - 0.8 && b < h.b1 + 0.8) || pl.flights.some((fl2) => fl2.f === f && b > Math.min(fl2.bFoot, fl2.bFoot + fl2.dir * fl2.run) - 0.6 && b < Math.max(fl2.bFoot, fl2.bFoot + fl2.dir * fl2.run) + 0.6);
+        const cand = [0, -ib * 0.5, ib * 0.5, -ib * 0.75, ib * 0.75].find((b) => !busy(b));
+        if (cand === undefined) continue;
+        cb = cand;
+      }
+      const kind = sp.kind === 'living' ? (s.light ? 1 : 2) : sp.kind === 'bedroom' ? (s.light === 1 ? 1 : 2) : sp.kind === 'hall' ? (s.light ? 2 : 0) : 0;
+      ceilingLight(Emit.at(fr, ca, yTop, cb, 0), K, kind, irng);
+    }
+  }
+  tk.rooms = (tk.rooms || 0) + triCount(K) + K.paper.i.length / 3 + K.plaster.i.length / 3 - tri0;
+  // thresholds under the doorways
+  for (let f = 0; f < floors; f++) for (const wl of pl.walls) for (const g of wl.gaps) {
+    const along = wl.axis === 'a', a0 = along ? g.c - g.w / 2 : wl.at - ti / 2 - 0.01, a1 = along ? g.c + g.w / 2 : wl.at + ti / 2 + 0.01, b0 = along ? wl.at - ti / 2 - 0.01 : g.c - g.w / 2, b1 = along ? wl.at + ti / 2 + 0.01 : g.c + g.w / 2;
+    const yy = (a, b) => (f === 0 ? pl.gyC(a, b) + 0.027 : fy[f] + 0.002), gq = K.floor, base = gq.count, col = mul(C(0xb89a7a), KIN * 0.85);
+    for (const [a, b] of [[a0, b0], [a1, b0], [a1, b1], [a0, b1]]) fr._v(gq, a, yy(a, b), b, 0, 1, 0, col, 1, (along ? b : a) / 2.4 + 0.3, (along ? a : b) / 2.4);
+    gq.i.push(base, base + 3, base + 2, base, base + 2, base + 1);
+  }
+  // a runner down the ground-floor hall
+  if (pl.hallL) {
+    rng.pick(CLOTH_COLS);
+    const fY0 = (a, b) => pl.gyC(a, b) + 0.025, len = ib * 2 - 2.4;
+    carpet(Emit.at(fr, pl.ah, 0, 0, -PI / 2, fY0), K.car, len, 1.0, 3, mul([1, 1, 1], KIN * 1.15), { h: 0.016 });
+  }
+
+  // ── furniture, the household pieces, the things on the walls
+  const spaceOf = (it) => (it.room >= 0 ? pl.roomsF.find((r) => r.f === it.f && r.id === it.room) : pl.halls.find((h) => h.f === it.f));
+  const SHADE = { bed: 0.62, cot: 0.75, sofa: 0.5, armchair: 0.52, wardrobe: 0.45, wardrobeDown: 0.5, shelf: 0.55, bookcase: 0.55, cabinet: 0.5, counter: 0.5, sideboard: 0.58, stove: 0.6,
+    fridge: 0.5, hutch: 0.48, dresser: 0.52, chest: 0.5, nightstand: 0.6, tv: 0.62, table: 0.72, ktable: 0.72, coffee: 0.7, tableDown: 0.7, crate: 0.5, barrel: 0.55, sacks: 0.55,
+    cases: 0.6, mattress: 0.6, gascyl: 0.6, plant: 0.6, sandbags: 0.5 };
+  const all = pl.furn.map((it, i) => [it, i + 1]).concat(pl.dress.map((it, i) => [it, 5000 + i]));
+  for (const [it, idx] of all) {
+    const sp = spaceOf(it), info = sp && floorCol.get(it.f + ':' + sp.id);
+    if (!sp || !info) continue;
+    const lift = it.f === 0 ? 0.025 : 0;
+    // contact shade on the floor round anything that stands on it
+    const sh = SHADE[it.kind];
+    if (sh && !it.deco) shadeUnder(fr, K, it, info, sh, lift);
+    if (it.kind === 'crate' || it.kind === 'barrel' || it.kind === 'sandbags') { drawMilitary(L, fr, K, pl, it, rng); continue; }
+    const E = Emit.at(fr, it.a, it.y + lift, it.b, it.ry, info.fY);
+    const c = { k: KIN, rng: makeRng((st.seed ^ Math.imul(idx, 0x9e3779b1)) >>> 0), room: sp.kind, lit: sp.lit, ceil: ceilY(it.f) - (it.y + lift), unit, unitG: unitPainted ? K.ena : K.ven, behind: windowBehind(pl, it) };
+    const n0 = triCount(K);
+    drawPiece(E, K, it, c);
+    tk[it.kind] = (tk[it.kind] || 0) + triCount(K) - n0;
+  }
+  // radiators and curtains at the windows
+  const tw0 = triCount(K);
+  for (const q of pl.winDress) {
+    const p = q.along === 'b' ? [q.at, q.s] : [q.s, q.at], E = Emit.at(fr, p[0], 0, p[1], RY_OF_WALL[q.side]);
+    const sgn = [-1, 1, 1, -1][q.side], W = q.W, flY = pl.floorAt(q.f, p[0], p[1]) + (q.f === 0 ? 0.025 : 0);
+    if (q.rad) radiator(E, K, q.rad.w, q.rad.h, flY, irng);
+    const col = (q.room + q.f) % 3 ? curtainCol : curtainCol2, cw = 0.34, rodY = W.yb + 0.22;
+    let lo = Infinity, hi = -Infinity;
+    for (const side of [0, 1]) {
+      const kind = q.curt[side];
+      if (!kind) continue;
+      const xc = sgn * (side ? 1 : -1) * (q.ww / 2 + 0.03 + cw / 2), yb = kind === 'long' ? flY + 0.03 : W.ya - 0.08;
+      curtain(E, K, xc, cw, yb, rodY - 0.02, mul(col, KIN), irng);
+      lo = Math.min(lo, xc - cw / 2); hi = Math.max(hi, xc + cw / 2);
+    }
+    if (hi > lo) {
+      const brass = mul(C(0xb8964e), KIN);
+      E.box(K.metal, (lo + hi) / 2, rodY, 0.1, hi - lo + 0.12, 0.022, 0.022, brass, {});
+      for (const x of [lo - 0.07, hi + 0.07]) E.box(K.metal, x, rodY, 0.1, 0.04, 0.04, 0.04, brass, { skip: 32 });
+    }
+  }
+  tk.windows = (tk.windows || 0) + triCount(K) - tw0;
+  // lamps you can see burning: a paraffin lamp, its glass lit
   for (const lp of pl.lamps) {
     if (lp.flicker) continue;
-    fr.box(K.metal, lp.a, lp.y - 0.3, lp.b, 0.14, 0.06, 0.14, C(0x6a6a60), {});
-    fr.box(K.glow, lp.a, lp.y - 0.16, lp.b, 0.09, 0.22, 0.09, C(0xffc070), {});
-    fr.box(K.metal, lp.a, lp.y - 0.02, lp.b, 0.06, 0.06, 0.06, C(0x3a3a36), {});
+    const E = Emit.at(fr, lp.a, lp.y - 0.35 + (lp.f === 0 ? 0.025 : 0), lp.b, 0), brass = mul(C(0xc8a050), KIN);
+    E.lathe(K.metal, 0, 0, 0, [[0.06, 0], [0.065, 0.012], [0.03, 0.04], [0.024, 0.07]], 9, brass, { capB: true });
+    E.lathe(K.cglass, 0, 0.07, 0, [[0.024, 0], [0.065, 0.03], [0.06, 0.08], [0.028, 0.1]], 9, [0.55, 0.65, 0.5], {});
+    E.lathe(K.metal, 0, 0.17, 0, [[0.035, 0], [0.035, 0.035], [0.03, 0.04]], 8, brass, {});
+    E.lathe(K.glow, 0, 0.21, 0, [[0.03, 0], [0.046, 0.06], [0.036, 0.13], [0.024, 0.22]], 9, C(0xffb860), {});
+    E.box(K.glow, 0, 0.255, 0, 0.02, 0.05, 0.02, C(0xfff0c0), {});
+  }
+}
+
+const triCount = (K) => (K.ven.i.length + K.ena.i.length + K.fab.i.length + K.car.i.length + K.floor.i.length + K.metal.i.length + K.cglass.i.length + K.glass.i.length) / 3;
+/** is there a window in the wall right behind a piece standing against it (no tiles or wall cupboards there)? */
+function windowBehind(pl, it) {
+  if (it.deco) return false;
+  const bk = [it.a - Math.sin(it.ry) * (it.d / 2 + 0.05), it.b - Math.cos(it.ry) * (it.d / 2 + 0.05)];
+  return pl.windows.some((W) => {
+    if (W.f !== it.f) return false;
+    const S = pl.sideByKey[W.side], wa = S.o[0] + S.t[0] * W.u - S.n[0] * pl.T, wb = S.o[1] + S.t[1] * W.u - S.n[1] * pl.T;
+    const along = Math.abs((wa - bk[0]) * Math.cos(it.ry) - (wb - bk[1]) * Math.sin(it.ry)), out = Math.abs((wa - bk[0]) * Math.sin(it.ry) + (wb - bk[1]) * Math.cos(it.ry));
+    return out < 0.3 && along < it.w / 2 + W.ww / 2;
+  });
+}
+
+/** a contact shade on the floor round a piece: floorboards darkened towards its footprint */
+function shadeUnder(fr, K, it, info, k0, lift) {
+  const { fcol, fY, sp } = info, wi = it.w / 2 - 0.02, di = it.d / 2 - 0.02, wo = it.w / 2 + 0.22, dO = it.d / 2 + 0.22;
+  const xs = [-wo, -wi, wi, wo], zs = [-dO, -di, di, dO], cs = Math.cos(it.ry), sn = Math.sin(it.ry), g = K.floor, base = g.count;
+  const warm = sp.lit ? WARM : [1, 1, 1], col = [fcol[0] * KIN * warm[0], fcol[1] * KIN * warm[1], fcol[2] * KIN * warm[2]];
+  const aoF = (a, b) => (1 - 0.34 * fall(a - sp.a0, 0.5)) * (1 - 0.34 * fall(sp.a1 - a, 0.5)) * (1 - 0.34 * fall(b - sp.b0, 0.5)) * (1 - 0.34 * fall(sp.b1 - b, 0.5));
+  for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
+    const x = xs[i], z = zs[j], a = it.a + x * cs + z * sn, b = it.b - x * sn + z * cs, inner = (i === 1 || i === 2) && (j === 1 || j === 2);
+    fr._v(g, a, fY(a, b) + 0.006, b, 0, 1, 0, col, aoF(a, b) * (inner ? k0 : 1), a / 2.4, b / 2.4);
+  }
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) { const q = base + j * 4 + i; g.i.push(q, q + 1, q + 4, q + 1, q + 5, q + 4); }
+  void lift;
+}
+
+/** cast-iron sectional radiator under a window, on two brackets, its pipe going down into the floor */
+function radiator(E, K, w, h, flY, rng) {
+  const col = mul(C(rng() < 0.6 ? 0xe8e4da : 0xc8ccc8), KIN), y0 = flY + 0.12, n = Math.max(4, Math.round(w / 0.085)), sw = w / n;
+  E.box(K.ena, 0, y0 + h / 2, 0.075, w, h, 0.07, mul(col, 0.85), { skip: 32 | 8 });
+  // the sections as one corrugated front
+  for (let i = 0; i < 2 * n; i++) {
+    const x0 = -w / 2 + sw * i / 2, x1 = x0 + sw / 2, z0 = i % 2 ? 0.135 : 0.11, z1 = i % 2 ? 0.11 : 0.135;
+    E.quad(K.ena, [[x0, y0 + 0.01, z0], [x1, y0 + 0.01, z1], [x1, y0 + h, z1], [x0, y0 + h, z0]], col, { ks: [0.75, 0.75, 1, 1] });
+  }
+  const pipe = mul(C(0x8a8a84), KIN);
+  E.box(K.metal, w / 2 + 0.05, (flY + y0 + h - 0.08) / 2, 0.06, 0.03, y0 + h - 0.08 - flY, 0.03, pipe, {});
+  E.box(K.metal, w / 2 + 0.025, y0 + h - 0.08, 0.06, 0.05, 0.03, 0.03, pipe, {});
+}
+
+/** a pleated curtain panel hanging from yt to yb, centred at x along the wall */
+function curtain(E, K, x, cw, yb, yt, col, rng) {
+  const m = 7, g = K.fab, sh = rng() * 0.08;
+  for (let i = 0; i < m - 1; i++) {
+    const x0 = x - cw / 2 + cw * i / (m - 1), x1 = x - cw / 2 + cw * (i + 1) / (m - 1), z0 = 0.05 + (i % 2) * 0.06, z1 = 0.05 + ((i + 1) % 2) * 0.06;
+    const k = i % 2 ? 0.82 - sh : 1;
+    E.quad(g, [[x0, yb, z0], [x1, yb, z1], [x1, yt, z1], [x0, yt, z0]], col, { us: 1.2, ks: [k * 0.85, k * 0.85, k, k] });
+  }
+}
+
+/** ceiling light, hanging down from y = 0 of E (the ceiling): 0 enamel shade, 1 chandelier, 2 glass dome */
+function ceilingLight(E, K, kind, rng) {
+  const k = KIN, brass = mul(C(0xb89a5a), k), white = mul(C(0xf2efe6), k * 1.1);
+  if (kind === 0) {
+    E.lathe(K.metal, 0, -0.02, 0, [[0.04, 0], [0.04, 0.02]], 6, mul(C(0xe8e4dc), k), { capB: true });
+    E.box(K.dark, 0, -0.32, 0, 0.008, 0.6, 0.008, [0.05, 0.05, 0.05], {});
+    E.lathe(K.ena, 0, -0.78, 0, [[0.2, 0], [0.1, 0.12], [0.025, 0.2]], 8, mul(C(rng() < 0.5 ? 0x3e6a4a : 0xe8e4da), k), { cap: true });
+    E.lathe(K.ena, 0, -0.8, 0, [[0.0, 0], [0.04, 0.04], [0.02, 0.09]], 6, white, {});
+  } else if (kind === 1) {
+    E.lathe(K.metal, 0, -0.04, 0, [[0.07, 0], [0.06, 0.03], [0.02, 0.04]], 8, brass, { capB: true });
+    E.box(K.metal, 0, -0.3, 0, 0.016, 0.5, 0.016, brass, {});
+    E.lathe(K.metal, 0, -0.62, 0, [[0.0, 0], [0.05, 0.04], [0.03, 0.1], [0.012, 0.12]], 8, brass, {});
+    for (let i = 0; i < 3; i++) {
+      const a = i * 2 * PI / 3 + rng(), cx = Math.cos(a) * 0.26, cz = Math.sin(a) * 0.26;
+      E.box(K.metal, cx / 2, -0.58, cz / 2, 0.26, 0.012, 0.012, brass, { ry: -a });
+      E.lathe(K.ena, cx, -0.64, cz, [[0.02, 0], [0.075, 0.05], [0.08, 0.12]], 7, white, {});
+    }
+  } else {
+    E.lathe(K.metal, 0, -0.012, 0, [[0.14, 0], [0.14, 0.012]], 10, mul(C(0xb8b4aa), k), { capB: true });
+    E.lathe(K.ena, 0, -0.13, 0, [[0.0, 0], [0.09, 0.02], [0.13, 0.08], [0.125, 0.12]], 9, white, {});
+  }
+}
+
+/** crates, barrels and the sandbag firing steps of the garrisoned houses */
+function drawMilitary(L, fr, K, pl, it, rng) {
+  if (it.kind === 'crate') { const p = fr.W(it.a, it.b); buildProp(L, 'crate', { x: p[0], z: p[1], s: 1, rot: pl.R + it.ry, y: it.y }); return; }
+  if (it.kind === 'barrel') { const p = fr.W(it.a, it.b); buildProp(L, 'barrel', { x: p[0], z: p[1], y: it.y }); return; }
+  // a firing step of bags under the window: one squashed box per bag, courses laid in bond
+  const I = itemFrame(fr, it), w = it.w, h = it.h, n = Math.max(1, Math.round(h / 0.17)), bh = h / n;
+  for (let c2 = 0; c2 < n; c2++) {
+    const cnt = Math.max(1, Math.round(w / 0.5)), sp = w / cnt, off = c2 % 2 ? sp / 2 : 0;
+    for (let i = 0; i < cnt - (c2 % 2 ? 1 : 0); i++) for (const lz of [-0.15, 0.15]) {
+      I.box(K.cloth, -w / 2 + sp * (i + 0.5) + off + rng.range(-0.03, 0.03), bh * (c2 + 0.5), lz, sp * 1.02, bh * 1.08, 0.3, mul(C(rng.pick(BAG_COLS)), KIN * rng.range(0.9, 1.1)),
+        { us: 1.2, ry: rng.range(-0.06, 0.06), rz: rng.range(-0.04, 0.04), skip: 8, kb: 0.8 });
+    }
   }
 }
 
@@ -442,147 +776,6 @@ function drawRail(fr, K, st, pl, rl) {
   fr.box(K.pwood, p[0], y + 0.5, p[1], rl.axis === 'a' ? len : 0.04, 0.04, rl.axis === 'a' ? 0.04 : len, st.frame, { us: 0.9, k: KIN });
   const n = Math.max(1, Math.round(len / 0.9));
   for (let k = 0; k <= n; k++) { const q = at(rl.from + (k / n) * len); fr.box(K.pwood, q[0], y + 0.48, q[1], 0.06, 0.96, 0.06, st.frame, { us: 0.9, k: KIN, skip: 4 | 8 }); }
-}
-
-/** Furniture, from simple boxes, in the item's own frame. */
-function drawItem(L, fr, K, st, pl, it, rng) {
-  const wc = C(rng.pick(WOOD_COLS)), k = KIN;
-  const I = itemFrame(fr, it);
-  const w = it.w, dd = it.d, h = it.h;
-  switch (it.kind) {
-    case 'table': {
-      I.box(K.wood, 0, h - 0.02, 0, w, 0.04, dd, wc, { us: 1.8, k });
-      for (const sx of [-1, 1]) for (const sz of [-1, 1]) I.box(K.wood, sx * (w / 2 - 0.07), (h - 0.04) / 2, sz * (dd / 2 - 0.07), 0.05, h - 0.04, 0.05, mul(wc, 0.85), { us: 1.8, k, skip: 4 | 8 });
-      I.box(K.wood, 0, h - 0.09, 0, w - 0.14, 0.09, dd - 0.14, mul(wc, 0.8), { us: 1.8, k, skip: 4 });
-      if (rng.chance(0.4)) I.box(K.cloth, 0, h + 0.003, 0, w + 0.1, 0.006, dd + 0.1, C(rng.pick([0xd8d0c0, 0xa86a5a, 0x8a9aa8])), { us: 1.2, k, skip: 8 });
-      if (it.radio) {
-        I.box(K.paint, -0.2, h + 0.13, -0.1, 0.42, 0.26, 0.26, C(0x4e5638), { us: 1.6, k });
-        I.box(K.dark, -0.2, h + 0.15, 0.031, 0.32, 0.12, 0.002, C(0x1a1a18), {});
-        I.box(K.glow, -0.05, h + 0.21, 0.032, 0.02, 0.02, 0.004, C(0x57ff7a), {});
-        I.box(K.metal, -0.36, h + 0.6, -0.16, 0.012, 0.7, 0.012, C(0x3a3a36), {});
-        I.box(K.paint, 0.25, h + 0.04, 0.05, 0.2, 0.06, 0.14, C(0x2a2a28), { k });
-      } else if (rng.chance(0.5)) {
-        I.box(K.paint, rng.range(-0.4, 0.4), h + 0.05, rng.range(-0.2, 0.2), 0.1, 0.1, 0.1, C(rng.pick([0xb8b0a0, 0x6a7a8a, 0x8a5a3a])), { k });
-      }
-      break;
-    }
-    case 'tableDown': {
-      // on its side: the top stands up as cover, the legs stick out
-      I.box(K.wood, 0, 0.4, 0, w, 0.8, 0.04, wc, { us: 1.8, k, rz: 0.04 });
-      for (const sx of [-1, 1]) for (const yy of [0.08, 0.72]) I.box(K.wood, sx * (w / 2 - 0.07), yy, 0.38, 0.05, 0.05, 0.72, mul(wc, 0.85), { us: 1.8, k });
-      break;
-    }
-    case 'chair': case 'chairDown': {
-      const J = it.kind === 'chairDown' ? itemFrame(fr, { ...it, y: it.y + 0.22 }, -PI / 2 + 0.1) : I;
-      const cw = C(rng.pick(WOOD_COLS));
-      J.box(K.wood, 0, 0.45, 0, 0.42, 0.04, 0.42, cw, { us: 1.8, k });
-      J.box(K.wood, 0, 0.7, -0.19, 0.42, 0.42, 0.035, cw, { us: 1.8, k });
-      for (const sx of [-1, 1]) for (const sz of [-1, 1]) J.box(K.wood, sx * 0.18, 0.22, sz * 0.18, 0.035, 0.44, 0.035, mul(cw, 0.85), { us: 1.8, k, skip: 4 | 8 });
-      break;
-    }
-    case 'bed': case 'cot': {
-      const cot = it.kind === 'cot', fc = cot ? C(0x4a5040) : wc;
-      I.box(cot ? K.paint : K.wood, 0, cot ? 0.3 : 0.24, 0, w, cot ? 0.05 : 0.22, dd, fc, { us: 1.8, k });
-      for (const sx of [-1, 1]) for (const sz of [-1, 1]) I.box(cot ? K.paint : K.wood, sx * (w / 2 - 0.04), 0.14, sz * (dd / 2 - 0.04), 0.05, 0.28, 0.05, mul(fc, 0.8), { k, skip: 4 | 8 });
-      const blanket = C(rng.pick(CLOTH_COLS));
-      I.box(K.cloth, 0.06, cot ? 0.38 : 0.44, 0, w - 0.14, cot ? 0.08 : 0.16, dd - 0.08, cot ? C(0x6a6a50) : C(0xc8c0b0), { us: 1.2, k });
-      I.box(K.cloth, 0.25, cot ? 0.43 : 0.53, 0, w * 0.62, 0.04, dd - 0.02, blanket, { us: 1.2, k, ry: rng.range(-0.06, 0.06) });
-      I.box(K.cloth, -w / 2 + 0.3, cot ? 0.45 : 0.56, 0, 0.36, 0.1, dd * 0.6, C(0xd8d4c8), { us: 1.2, k });
-      if (!cot) I.box(K.wood, -w / 2 + 0.03, 0.5, 0, 0.06, 1.0, dd, mul(wc, 0.9), { us: 1.8, k });
-      break;
-    }
-    case 'wardrobe': {
-      const col = C(rng.pick([0x7a5a3e, 0x6a4e38, 0x8a7a60, 0x5e4a3a]));
-      I.box(K.pwood, 0, h / 2, 0, w, h, dd, col, { us: 0.9, k });
-      I.box(K.dark, 0, h / 2, dd / 2 + 0.001, 0.012, h - 0.2, 0.002, C(0x2a2622), {});
-      for (const sx of [-1, 1]) I.box(K.metal, sx * 0.06, h * 0.52, dd / 2 + 0.015, 0.02, 0.12, 0.02, C(0x8a8478), {});
-      I.box(K.pwood, 0, h + 0.03, 0, w + 0.06, 0.06, dd + 0.04, mul(col, 0.9), { us: 0.9, k });
-      break;
-    }
-    case 'wardrobeDown': {
-      // knocked over onto its back, doors to the ceiling
-      const col = C(rng.pick([0x7a5a3e, 0x6a4e38, 0x8a7a60, 0x5e4a3a]));
-      I.box(K.pwood, 0, h / 2, 0, w, h, dd, col, { us: 0.9, k, ry: 0.05 });
-      I.box(K.dark, 0, h + 0.001, 0, 0.012, 0.002, dd - 0.1, C(0x2a2622), {});
-      break;
-    }
-    case 'shelf': {
-      const col = C(rng.pick([0x6a4e38, 0x7a5a3e, 0x8a7a60]));
-      for (const sx of [-1, 1]) I.box(K.pwood, sx * (w / 2 - 0.02), h / 2, 0, 0.04, h, dd, col, { us: 0.9, k });
-      I.box(K.pwood, 0, h / 2, -dd / 2 + 0.01, w - 0.08, h, 0.02, mul(col, 0.8), { us: 0.9, k });
-      for (let s = 0; s < 5; s++) {
-        const yy = 0.06 + s * (h - 0.1) / 4;
-        I.box(K.pwood, 0, yy, 0, w - 0.08, 0.025, dd, col, { us: 0.9, k });
-        if (s < 4 && rng.chance(0.7)) {
-          // books in runs, one block per run
-          let xx = -w / 2 + 0.06;
-          while (xx < w / 2 - 0.2) {
-            const bw = rng.range(0.15, 0.4), bh = rng.range(0.18, 0.28);
-            if (xx + bw > w / 2 - 0.05) break;
-            I.box(K.cloth, xx + bw / 2, yy + 0.012 + bh / 2, 0.02, bw, bh, dd * 0.7, C(rng.pick(CLOTH_COLS)), { us: 1.2, k, skip: 8 });
-            xx += bw + rng.range(0.02, 0.25);
-          }
-        }
-      }
-      break;
-    }
-    case 'cabinet': {
-      const col = C(rng.pick([0x6a4e38, 0x7a5a3e, 0x8a7a60, 0x9a9a88]));
-      I.box(K.pwood, 0, h / 2, 0, w, h, dd, col, { us: 0.9, k });
-      I.box(K.dark, 0, h / 2 - 0.05, dd / 2 + 0.001, 0.01, h - 0.2, 0.002, C(0x2a2622), {});
-      I.box(K.pwood, 0, h + 0.015, 0, w + 0.04, 0.03, dd + 0.03, mul(col, 0.9), { us: 0.9, k });
-      for (const sx of [-1, 1]) I.box(K.metal, sx * 0.08, h * 0.6, dd / 2 + 0.012, 0.06, 0.02, 0.02, C(0x8a8478), {});
-      break;
-    }
-    case 'sofa': {
-      const col = C(rng.pick(CLOTH_COLS));
-      I.box(K.cloth, 0, 0.22, 0.05, w, 0.3, dd - 0.1, mul(col, 0.85), { us: 1.2, k });
-      I.box(K.cloth, 0, 0.42, 0.08, w - 0.3, 0.12, dd - 0.25, col, { us: 1.2, k });
-      I.box(K.cloth, 0, 0.6, -dd / 2 + 0.12, w, 0.55, 0.22, col, { us: 1.2, k });
-      for (const sx of [-1, 1]) I.box(K.cloth, sx * (w / 2 - 0.1), 0.45, 0.05, 0.2, 0.3, dd - 0.1, mul(col, 0.9), { us: 1.2, k });
-      break;
-    }
-    case 'stove': {
-      const iron = C(0x2e2e2c);
-      I.box(K.paint, 0, 0.5, 0, w, 0.7, dd, iron, { us: 1.6, k: 0.9 });
-      I.box(K.paint, 0, 0.87, 0, w + 0.06, 0.04, dd + 0.06, mul(iron, 1.2), { us: 1.6 });
-      for (const sx of [-1, 1]) for (const sz of [-1, 1]) I.box(K.paint, sx * (w / 2 - 0.05), 0.075, sz * (dd / 2 - 0.05), 0.06, 0.15, 0.06, iron, { skip: 4 | 8 });
-      if (it.fire) { I.box(K.glow, 0, 0.42, dd / 2 + 0.004, 0.26, 0.18, 0.006, C(0xff8a30), {}); I.box(K.glow, 0, 0.36, dd / 2 + 0.006, 0.18, 0.05, 0.006, C(0xffc060), {}); }
-      else I.box(K.paint, 0, 0.42, dd / 2 + 0.005, 0.28, 0.2, 0.01, mul(iron, 1.3), {});
-      // flue up to the ceiling
-      const ceil = (it.f + 1 < pl.floors ? pl.fy[it.f + 1] : pl.top) - pl.slab - it.y;
-      I.box(K.paint, 0, (0.89 + ceil) / 2, -dd / 2 + 0.12, 0.13, ceil - 0.89, 0.13, mul(iron, 1.1), { us: 1.6, skip: 4 | 8 });
-      break;
-    }
-    case 'rug': {
-      const col = C(rng.pick(CLOTH_COLS));
-      I.box(K.cloth, 0, 0.008, 0, w, 0.012, dd, mul(col, 0.8), { us: 1.2, k, skip: 8 });
-      I.box(K.cloth, 0, 0.016, 0, w - 0.25, 0.004, dd - 0.25, col, { us: 1.2, k, skip: 8 });
-      break;
-    }
-    case 'crate': {
-      const p = fr.W(it.a, it.b);
-      buildProp(L, 'crate', { x: p[0], z: p[1], s: 1, rot: pl.R + it.ry, y: it.y });
-      break;
-    }
-    case 'barrel': {
-      const p = fr.W(it.a, it.b);
-      buildProp(L, 'barrel', { x: p[0], z: p[1], y: it.y });
-      break;
-    }
-    case 'sandbags': {
-      // a firing step of bags under the window: one squashed box per bag, courses laid in bond
-      const n = Math.max(1, Math.round(h / 0.17)), bh = h / n;
-      for (let c2 = 0; c2 < n; c2++) {
-        const cnt = Math.max(1, Math.round(w / 0.5)), sp = w / cnt, off = c2 % 2 ? sp / 2 : 0;
-        for (let i = 0; i < cnt - (c2 % 2 ? 1 : 0); i++) for (const lz of [-0.15, 0.15]) {
-          I.box(K.cloth, -w / 2 + sp * (i + 0.5) + off + rng.range(-0.03, 0.03), bh * (c2 + 0.5), lz, sp * 1.02, bh * 1.08, 0.3, mul(C(rng.pick(BAG_COLS)), KIN * rng.range(0.9, 1.1)),
-            { us: 1.2, ry: rng.range(-0.06, 0.06), rz: rng.range(-0.04, 0.04), skip: 8, kb: 0.8 });
-        }
-      }
-      break;
-    }
-  }
 }
 
 // ───────────────────────────── roof ─────────────────────────────
@@ -744,6 +937,7 @@ export class DoorSystem {
   }
 
   update(dt) {
+    cullInteriors(this.L);
     for (const dr of this.doors) {
       const goal = dr.target ? DOOR.openAng : 0;
       if (dr.ang === goal) continue;

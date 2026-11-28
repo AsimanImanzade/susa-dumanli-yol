@@ -28,6 +28,7 @@ export const save = {
     for (const k of ['volMaster', 'volMusic', 'volSfx']) s[k] = Math.min(1, Math.max(0, +s[k]));
     if (!['low', 'medium', 'high'].includes(s.quality)) s.quality = 'medium';
     if (!['az', 'en'].includes(s.lang)) s.lang = 'az';
+    for (const k of ['invertY', 'motionBlur', 'killCam', 'subtitles', 'showFps', 'hudPercent']) s[k] = !!s[k];
     return s;
   },
   saveSettings(s) { write(K.settings, s); },

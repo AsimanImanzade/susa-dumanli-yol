@@ -29,6 +29,8 @@ export const equip = {
   nvg: { on: false, battery: 100 }, binoc: false, using: null, cook: null,
   wheelOpen: false, wheelX: 0, wheelY: 0, wheelSel: -1,
   arc: null,
+  /** Cosmetic event counters for the first-person animations (vm-items.js); nothing in the game reads them. */
+  anim: { use: 0, item: null, thrown: 0, placed: 0, det: 0 },
 
   init() {
     const g = new THREE.BufferGeometry();
@@ -81,6 +83,7 @@ export const equip = {
   },
   _finishUse() {
     const p = G.player, item = this.using.item;
+    this.anim.use++; this.anim.item = item;
     this.inv[item]--;
     if (item === 'medkit') { p.health = Math.min(PLAYER.maxHealth, p.health + ITEMS.medkit.heal); p.bleed = 0; }
     else if (item === 'bandage') { p.health = Math.min(PLAYER.maxHealth, p.health + ITEMS.bandage.heal); if (p.bleed === 1) p.bleed = 0; }
@@ -242,6 +245,7 @@ export const equip = {
   _throw(kind, fuse) {
     if (!(this.inv[kind] > 0)) return;
     this.inv[kind]--;
+    this.anim.thrown++;
     const o = this._launch(kind);
     o.kind = kind; o.mesh = buildItem(kind); o.bounces = 0; o.age = 0; o.done = false;
     o.fuse = fuse ?? (kind === 'smoke' ? THROW.smoke.fuse : kind === 'flash' ? THROW.flash.fuse : 999);
@@ -322,7 +326,7 @@ export const equip = {
   /** Fragmentation blast (player frag, enemy frag or C4). */
   _explode(o) {
     const cfg = o.kind === 'c4' ? THROW.c4 : o.enemy ? THROW.enemyFrag : THROW.frag, p = G.player;
-    fx.explosion(o.x, o.y, o.z, cfg.radius);
+    fx.blast(o.x, o.y, o.z, cfg.radius, o.kind === 'c4' ? 'c4' : 'frag');
     R.flashAt(o.x, o.y + 0.5, o.z, 14, cfg.radius * 3, 0.14);
     audio.play('explosion', { x: o.x, y: o.y, z: o.z, vol: 1, ref: 14 });
     noise.emit({ x: o.x, y: o.y, z: o.z, radius: o.kind === 'c4' ? NOISE.c4 : NOISE.explosion, kind: 'explosion', byPlayer: !o.enemy, byEnemy: !!o.enemy, time: G.simTime });
@@ -396,9 +400,11 @@ export const equip = {
     this.c4s.push(c);
     this.inv.c4--;
     audio.play('beep', { vol: 0.6 }); bus.emit('toast', t('c4Placed'));
+    this.anim.placed++;
     return true;
   },
   _detonate() {
+    this.anim.det++;
     audio.play('beep', { vol: 0.8, rate: 1.4 });
     for (const c of this.c4s) {
       const o = { x: c.x, y: c.y, z: c.z, kind: 'c4', veh: c.veh };

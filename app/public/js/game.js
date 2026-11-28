@@ -245,6 +245,37 @@ export const game = {
     return { main: t(L.objective), opt: '', remaining: -1 };
   },
 
+  /**
+   * Every task of the act, one entry per line on the HUD:
+   * [{ id, text, optional, done, point: {x,z}|null, moving }]. The main task comes first;
+   * optional tasks stay in the list once done (done: true) so the HUD can tick them off.
+   * `moving` marks a target whose point follows it (the tank); the HUD decides when to show it.
+   */
+  objectives() {
+    const L = G.level, m = G.mission;
+    if (!L || !m) return [];
+    const o = this.objective(), list = [{ id: 'main', text: o.main, optional: false, done: false, point: this.objectivePoint(), moving: false }];
+    const tank = vehicles.tanks[0];
+    const tankTask = (key) => list.push({ id: 'tank', text: t(key), optional: true, done: !tank.alive, point: tank.alive ? { x: tank.x, z: tank.z } : null, moving: true });
+    if (m.act === 1) {
+      const svd = L.pickups.find((p) => p.type === 'weapon_svd');
+      const held = ['p1', 'p2'].some((k) => weapons.slots[k] && weapons.slots[k].id === 'svd');
+      if (svd) list.push({ id: 'svd', text: t('ob_svd'), optional: true, done: held, point: held || svd.taken ? null : { x: svd.x, z: svd.z }, moving: false });
+      if (vehicles.has('gun')) {
+        const guns = vehicles.list.filter((v) => v.alive && (v.kind === 'gun' || v.kind === 'mortar'));
+        const pt = guns.length ? { x: guns.reduce((s, v) => s + v.def.x, 0) / guns.length, z: guns.reduce((s, v) => s + v.def.z, 0) / guns.length } : null;
+        list.push({ id: 'battery', text: t('ob_battery'), optional: true, done: !guns.length, point: pt, moving: false });
+      }
+    } else if (m.act === 3) {
+      if (L.relayObj) list.push({ id: 'relay', text: t('ob_relay'), optional: true, done: !L.relayObj.alive, point: L.relayObj.alive ? { x: L.relayObj.x, z: L.relayObj.z } : null, moving: false });
+      if (tank) tankTask('ob_tank3');
+    } else if (m.act === 4) {
+      if (tank && !(m.flagRaised && tank.alive)) tankTask('ob_tank4');
+    }
+    list[0].remaining = o.remaining;
+    return list;
+  },
+
   /** Where the compass / objective marker should point. */
   objectivePoint() {
     const L = G.level, m = G.mission;

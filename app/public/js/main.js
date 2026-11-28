@@ -22,10 +22,11 @@ import { ui } from './ui.js';
 import { audio } from './audio.js';
 import { net } from './net.js';
 import { debug } from './debug.js';
+import { menuScene } from './menu-scene.js';
 
 const STEP = 1 / 60;
 const mouse = { x: 0, y: 0 };
-let last = 0, acc = 0;
+let last = 0, acc = 0, menuAcc = 1, lastDraw = 0;
 
 async function loadManifest() {
   try {
@@ -40,13 +41,12 @@ function frame(now) {
   const dtReal = Math.min(0.1, (now - last) / 1000 || 0);
   last = now;
   G.realTime += dtReal;
-  debug.frame(dtReal);
 
   const running = G.playing && !G.paused && G.mission && G.level;
   if (running) {
     const p = G.player;
     // pause / map keys are handled outside the fixed step so they always register
-    if (input.pressed('pause')) { input.endStep(); ui.pause(); R.render(G.realTime); return; }
+    if (input.pressed('pause')) { input.endStep(); ui.pause(); draw(now); return; }
     if (input.pressed('map')) hud.toggleMap();
 
     input.consumeMouse(mouse);
@@ -82,7 +82,20 @@ function frame(now) {
     input.consumeMouse(mouse);
     input.endStep();
     if (G.level && G.mission) R.update(0, G.realTime);
+    else if (menuScene.active) {
+      // on a 120/144 Hz display the backdrop draws every other refresh; 60–100 Hz displays draw every frame
+      menuAcc += dtReal;
+      if (menuAcc < 0.0095) return;
+      menuScene.frame(menuAcc); menuAcc = 0;
+    }
   }
+  draw(now);
+}
+
+/** Render one frame; the FPS readouts count drawn frames. */
+function draw(now) {
+  debug.frame(Math.min(0.25, (now - lastDraw) / 1000 || 0));
+  lastDraw = now;
   R.render(G.realTime);
 }
 
@@ -111,7 +124,8 @@ export async function boot() {
   // losing the pointer or the window pauses the mission
   bus.on('locklost', () => { if (!input.allowUnlocked) ui.pause(); });
   bus.on('focuslost', () => ui.pause());
-  bus.on('lockerror', () => { /* the pause screen's Resume button asks again */ });
+  // a refused lock (Chrome refuses for ~1 s after Esc left it) leaves the game paused behind a click-to-resume card
+  bus.on('lockerror', () => ui.lockRefused());
   canvas.addEventListener('click', () => { if (G.playing && !G.paused && !input.locked) input.requestLock(); });
 
   document.getElementById('boot').remove();

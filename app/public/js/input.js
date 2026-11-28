@@ -17,6 +17,7 @@ let binds = { ...DEFAULT_BINDS };
 let codeToActions = new Map();
 let canvas = null;
 let captureCb = null;                   // rebinding: next key goes here
+let uiHook = null;                      // menus: (KeyboardEvent) → true when the screen used the key
 let enabled = true;
 
 function rebuild() {
@@ -69,6 +70,10 @@ export const input = {
     rebuild();
 
     window.addEventListener('keydown', (e) => {
+      // a rebind takes the very next key, whatever it is (arrows, Enter and Esc are legal binds)
+      if (captureCb) { if (!e.repeat) onCode(e.code, true, e); else e.preventDefault(); return; }
+      // then the menus: a key a screen uses never reaches the game (so Esc on the pause screen cannot latch 'pause')
+      if (uiHook && uiHook(e)) { e.preventDefault(); return; }
       if (e.repeat) { if (enabled && codeToActions.has(e.code)) e.preventDefault(); return; }
       const tag = e.target && e.target.tagName;
       if ((tag === 'INPUT' || tag === 'TEXTAREA') && !captureCb) return;   // typing a name
@@ -98,15 +103,18 @@ export const input = {
       if (was && !this.locked) { this.releaseAll(); bus.emit('locklost'); }
       if (!was && this.locked) bus.emit('lockgained');
     });
-    document.addEventListener('pointerlockerror', () => bus.emit('lockerror'));
+    document.addEventListener('pointerlockerror', () => { this._reqAt = -1e9; bus.emit('lockerror'); });
   },
 
   /** Ask for pointer lock. Must be called from a user gesture; failure is reported via 'lockerror'. */
   requestLock() {
-    if (!canvas || this.locked) return;
+    // one request at a time: a click that resumes is followed by the same click landing on the canvas
+    const now = performance.now();
+    if (!canvas || this.locked || now - (this._reqAt || -1e9) < 400) return;
+    this._reqAt = now;
     try {
       const p = canvas.requestPointerLock();
-      if (p && p.catch) p.catch(() => bus.emit('lockerror'));
+      if (p && p.catch) p.catch(() => { this._reqAt = -1e9; bus.emit('lockerror'); });
     } catch { bus.emit('lockerror'); }
   },
   exitLock() { if (document.pointerLockElement) document.exitPointerLock(); },
@@ -142,6 +150,9 @@ export const input = {
   /** Route the next key or mouse button to cb(code) instead of the game. */
   capture(cb) { captureCb = cb; },
   cancelCapture() { captureCb = null; },
+  capturing() { return !!captureCb; },
+  /** Menus get first look at every key (after a rebind capture); fn(e) returns true when it used the key. */
+  setUiHook(fn) { uiHook = fn; },
 
   /** Test hook: drive an action programmatically. */
   inject(action, down) { setAction(action, down); },

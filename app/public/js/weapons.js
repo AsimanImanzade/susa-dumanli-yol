@@ -15,6 +15,7 @@ import { fx } from './fx.js';
 import { ai } from './ai.js';
 import { R } from './render.js';
 import { buildViewModel } from './models.js';
+import { vmItems } from './vm-items.js';
 import { TEX } from './textures.js';
 import { t } from './loc.js';
 
@@ -51,6 +52,7 @@ export const weapons = {
     this.flash = new THREE.Sprite(new THREE.SpriteMaterial({ map: TEX.puff, color: 0xffd08a, transparent: true, blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false }));
     this.flash.visible = false;
     G.vmScene.add(this.flash);
+    vmItems.init();
   },
 
   reset() {
@@ -64,6 +66,7 @@ export const weapons = {
     this.projectiles.length = 0;
     this.ads = 0; this.scoped = false; this.zoomI = 0; this.kick = 0; this.burstI = 0; this.lastShot = -10; this.cool = 0;
     this.swayX = 0; this.swayY = 0; this.lagX = 0; this.lagY = 0; this.flashT = 0; this.flashK = 1;
+    vmItems.reset();
   },
   _clearActions() { this.reloading = null; this.switching = null; this.supAnim = null; this.melee = null; this.takedown = null; this.dryLatch = false; },
 
@@ -484,16 +487,16 @@ export const weapons = {
       sx = Math.sin(tt * 0.9) * this.swayAmp + Math.sin(tt * 2.3) * this.swayAmp * 0.3;
       sy = Math.sin(tt * 1.8) * this.swayAmp * 0.6 + Math.cos(tt * 0.7) * this.swayAmp * 0.4;
     }
-    this.swayX = sx; this.swayY = sy;
+    this.swayX = sx; this.swayY = sy + vmItems.dipY;       // dipY: item animations glance down (camera only)
 
     // ── choose which model is on screen
     const knife = !!(this.melee || this.takedown);
     const hideAll = p.dead || this.scoped || p.frozen && !this.takedown || p.ladder || p.dragging || (G.equip && (G.equip.binoc));
     for (const id in this.vms) this.vms[id].root.visible = false;
-    if (hideAll) { this.flash.visible = false; return; }
+    if (hideAll) { this.flash.visible = false; vmItems.frame(dt, null); return; }
     const vm = this.vms[knife ? 'knife' : w.id], root = vm.root;
     root.visible = true;
-    if (vm.sup) vm.sup.visible = w.sup !== null || (this.supAnim && (this.supAnim.attach ? this.supAnim.t > 0.5 : this.supAnim.t < 0.6));
+    if (vm.sup) vm.sup.visible = w.sup !== null || (this.supAnim && (this.supAnim.attach ? this.supAnim.t > 0.5 : this.supAnim.t < 0.6)) || vmItems.showSup;
 
     // base pose: hip ↔ ADS
     const a = knife ? 0 : this.ads * this.ads * (3 - 2 * this.ads);
@@ -513,13 +516,19 @@ export const weapons = {
     // sprint: gun swings across the body
     this.sprintK = damp(this.sprintK || 0, p.sprinting ? 1 : 0, 9, dt);
     ry += this.sprintK * 0.7; rx -= this.sprintK * 0.25; x -= this.sprintK * 0.06; y -= this.sprintK * 0.05;
-    // lowered while using an item, cooking a grenade or with the wheel open
-    const lower = G.equip && (G.equip.using || G.equip.wheelOpen || G.equip.cook) ? 1 : 0;
-    this.lowerK = damp(this.lowerK || 0, lower, 10, dt);
+    // lowered while using an item, cooking a grenade or with the wheel open; an item animation (vm-items.js) decides while it runs
+    const e = G.equip, ia = vmItems.active;
+    const lower = ia ? vmItems.lower : e && ((e.using && e.using.item !== 'repair') || e.wheelOpen || e.cook) ? 1 : 0;
+    this.lowerK = damp(this.lowerK || 0, lower, ia ? 14 : 10, dt);
     y -= this.lowerK * 0.3; rx -= this.lowerK * 0.6;
+    if (ia) { const o = vmItems.gun; x += o.x; y += o.y; z += o.z; rx += o.rx; ry += o.ry; rz += o.rz; }
+    if (ia && this.lowerK > 0.97) root.visible = false;     // all the way down: the item hands have the screen
 
     if (vm.mag) { vm.mag.position.set(0, 0, 0); vm.mag.visible = true; }
-    if (vm.handL) vm.handL.position.set(0, 0, 0);
+    if (vm.handL) {
+      const out = vmItems.handLOut;     // repair: the support hand makes way for the one holding the brush
+      vm.handL.position.set(0.03 * out, -0.24 * out, 0.12 * out); vm.handL.visible = out < 0.97;
+    }
     if (vm.slide) vm.slide.position.set(0, 0, 0);
     if (this.switching) { const k = Math.sin(clamp01(this.switching.t / 0.36) * Math.PI); y -= k * 0.28; rx -= k * 0.5; }
     if (this.reloading) {
@@ -560,6 +569,7 @@ export const weapons = {
       const s = (def.id === 'pistol' ? 0.16 : 0.26) * (this.flashK ?? 1) * (0.8 + Math.random() * 0.5);
       this.flash.scale.set(s, s, 1); this.flash.visible = true;
     } else this.flash.visible = false;
+    vmItems.frame(dt, knife ? null : vm);
   },
 
   /** HUD data for the weapon in hand. */

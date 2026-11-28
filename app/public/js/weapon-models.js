@@ -1321,3 +1321,131 @@ export const KIT = {
   fillet, arcPts, trisOf, faceAxisWear, mapP, flipTris, creaseNormals, hashRows,
   side, front, plan, box, lathe, revolve, torus, rrect, tube, loft, rbox, Occ, aoAt,
 };
+
+// ───────────────────────────── item hands and props ─────────────────────────────
+/**
+ * Finger poses for the item animations (vm-items.js). Same convention as buildHand:
+ * [spread, mcp, pip, dip] per finger, thumb joint Euler angles (YXZ).
+ */
+const ITEM_POSES = {
+  grip: { f: [[0.16, 0.74, 0.86, 0.48], [0.03, 0.8, 0.9, 0.5], [-0.07, 0.86, 0.88, 0.48], [-0.17, 0.92, 0.84, 0.46]], t: [[-0.72, 0.7, 0.62], [0.12, 0.32, 0], [0, 0.3, 0]] },
+  fist: { f: [[0.06, 1.25, 1.5, 0.9], [0.0, 1.3, 1.5, 0.9], [-0.04, 1.35, 1.45, 0.85], [-0.08, 1.4, 1.4, 0.8]], t: [[-0.5, 0.9, 0.6], [0.2, 0.3, 0], [0, 0.4, 0]] },
+  pinch: { f: [[0.1, 0.62, 0.95, 0.6], [0.0, 1.2, 1.4, 0.8], [-0.06, 1.32, 1.4, 0.8], [-0.12, 1.42, 1.36, 0.75]], t: [[-0.62, 0.62, 0.42], [0.15, 0.38, 0], [0, 0.38, 0]] },
+  flat: { f: [[0.13, 0.12, 0.12, 0.06], [0.02, 0.08, 0.1, 0.05], [-0.07, 0.1, 0.12, 0.06], [-0.17, 0.14, 0.14, 0.07]], t: [[-0.12, 0.6, 0.12], [0.05, 0.12, 0], [0, 0.12, 0]] },
+  hold: { f: [[0.1, 0.5, 0.62, 0.34], [0.02, 0.55, 0.62, 0.34], [-0.06, 0.6, 0.62, 0.34], [-0.14, 0.66, 0.6, 0.34]], t: [[-0.3, 0.72, 0.25], [0.06, 0.18, 0], [0, 0.18, 0]] },
+};
+/** Elbow of the item arms in the canonical wrist frame, and the sleeve's section along the forearm (as buildSleeve makes it). */
+const ARM_ELBOW = [0.004, -0.012, 0.3];
+function sleeveAt(z, extra = 0, out = { c: [0, 0, 0], w: 0, h: 0, r: 0.05 }) {
+  const t = clamp01((z - 0.03) / (ARM_ELBOW[2] - 0.03)), g = Math.sqrt(t), hem = t <= 0.07 ? 0.007 : t < 0.09 ? 0.003 : 0;
+  out.c[0] = ARM_ELBOW[0] * t; out.c[1] = lerp(0.0005, ARM_ELBOW[1], t); out.c[2] = z;
+  out.w = lerp(0.072, 0.11, g) + hem + extra; out.h = lerp(0.064, 0.1, g) + hem + extra;
+  return out;
+}
+/** A band round the forearm from z0 to z1 (bandage turns, the tourniquet strap). */
+function armBand(z0, z1, extra) { return loft([sleeveAt(z0, extra), sleeveAt((z0 + z1) / 2, extra * 1.05), sleeveAt(z1, extra)], { cap0: 'flat', cap1: 'flat', cseg: 6, sseg: 2, wear: false }); }
+
+/**
+ * Hands and props for the first-person item animations, built once at start-up.
+ *   hands   a right glove + sleeve per finger pose (grip, fist, pinch, flat, hold): wrist at the
+ *           origin, fingers along −Z, back of the hand +Y, thumb at −X, forearm along +Z. The left
+ *           hand is the same geometry mirrored (scale.x = −1).
+ *   props   pouch (+ lid hinged on its x axis), injector (+ cap), dressing, roll (along x), strip
+ *           (1 m along −Z, scaled to length), wraps (bandage turns, canonical arm frame), tourniquet
+ *           (+ rod), carrier (plate-carrier front, top edge at y = 0), rod (cleaning rod along −Z),
+ *           clacker (+ squeeze lever hinged at its back end).
+ */
+export function buildItemKit() {
+  const t0 = performance.now(), M = materials();
+  const hands = {}, props = {};
+  const F = new THREE.Matrix4();
+  for (const [name, pose] of Object.entries(ITEM_POSES)) {
+    const body = new Part();
+    buildHand(body, F, pose); buildSleeve(body, F, ARM_ELBOW, 0.9);
+    hands[name] = assemble({ body }).body;
+  }
+  const one = (fn) => { const p = new Part(); fn(p); return assemble({ body: p }).body; };
+  // a prop with one moving piece: both built in place (so the AO is right), then the piece is re-centred on its pivot
+  const two = (fa, fb, pivot = [0, 0, 0]) => {
+    const a = new Part(), b = new Part(); fa(a); fb(b);
+    const o = assemble({ body: a, sup: b });
+    for (const m of o.sup.children) { m.geometry.translate(-pivot[0], -pivot[1], -pivot[2]); m.geometry.computeBoundingSphere(); }
+    o.sup.position.fromArray(pivot); o.sup.visible = true; o.body.add(o.sup);
+    return { root: o.body, moving: o.sup };
+  };
+  const cloth = (part, pr, col, o = {}) => part.add(pr, M.cloth, { col, crease: 50, macro: 0.1, ...o });
+  const rub = (part, pr, col, o = {}) => part.add(pr, M.rubber, { col, crease: 50, ...o });
+  const poly = (part, pr, col, o = {}) => part.add(pr, M.poly, { col, crease: 40, ...o });
+  // medical pouch: red cordura, lid hinged along the back edge, black zip round three sides
+  const PW = 0.16, PT = 0.052, PD = 0.104;
+  const pouch = two((p) => {
+    cloth(p, rbox(0, 0, 0, PW, PT, PD, 0.016), 0x7a2a24);
+    cloth(p, rbox(0, PT / 2 - 0.002, -0.004, PW - 0.026, 0.006, PD - 0.028, 0.005), 0x161210, { macro: 0.05 });     // the opening
+    cloth(p, rbox(-0.028, PT / 2 - 0.0005, -0.006, 0.058, 0.008, 0.05, 0.003), 0x8a8264);                        // a dressing inside
+    cloth(p, lathe([[0.004, -0.028], [0.016, -0.03], [0.0165, 0.028], [0.004, 0.03]], { seg: 14, axis: 'x+', at: [0.038, PT / 2 - 0.008, 0.01] }), 0xe2dccb);
+    cloth(p, rbox(PW / 2 + 0.006, 0, 0, 0.01, 0.012, 0.05, 0.003), 0x2b2c25);                                     // grab handle
+  }, (p) => {
+    const y = PT / 2 - 0.003;
+    cloth(p, rbox(0, y + 0.004, 0, PW + 0.002, 0.01, PD + 0.002, 0.005), 0x7a2a24);
+    for (const s of [-1, 1]) rub(p, rbox(s * (PW / 2 - 0.001), y + 0.001, 0, 0.006, 0.006, PD - 0.01, 0.002), 0x191a17);
+    rub(p, rbox(0, y + 0.001, -PD / 2 + 0.001, PW - 0.01, 0.006, 0.006, 0.002), 0x191a17);
+    cloth(p, rbox(-0.008, y + 0.0095, 0, 0.062, 0.0016, 0.048, 0.002), 0x4b5038);
+    cloth(p, rbox(-0.008, y + 0.0105, 0, 0.036, 0.0012, 0.01, 0.0005), 0xb8b2a0);
+    cloth(p, rbox(-0.008, y + 0.0105, 0, 0.01, 0.0012, 0.036, 0.0005), 0xb8b2a0);
+    p.add(rbox(-PW / 2 + 0.008, y + 0.003, -PD / 2 + 0.002, 0.012, 0.004, 0.008, 0.0015), M.steel, { col: 0x3c3e3e });     // zip slider and pull
+    rub(p, rbox(-PW / 2 + 0.004, y + 0.002, -PD / 2 - 0.012, 0.005, 0.0028, 0.026, 0.0012), 0x1d1e1a);
+  }, [0, PT / 2 - 0.003, PD / 2 - 0.001]);
+  props.pouch = { root: pouch.root, lid: pouch.moving, size: [PW, PT, PD] };
+  // auto-injector along −Z (needle end forward), safety cap on the back
+  const inj = two((p) => {
+    poly(p, lathe([[0, -0.064], [0.0084, -0.064], [0.0094, -0.06], [0.0094, 0.05], [0.0084, 0.056], [0.0062, 0.06], [0.0062, 0.066], [0, 0.067]], { seg: 18 }), 0x56633f);
+    poly(p, lathe([[0.0097, 0.034], [0.0097, 0.046]], { seg: 18 }), 0xc9a227);
+    rub(p, lathe([[0.0063, 0.06], [0.0063, 0.067], [0, 0.068]], { seg: 14 }), 0x202020);
+  }, (p) => poly(p, lathe([[0, 0], [0.0102, 0], [0.0102, 0.022], [0.009, 0.025], [0, 0.025]], { seg: 18, axis: 'zb', at: [0, 0, 0.056] }), 0xc8762a));
+  props.injector = { root: inj.root, cap: inj.moving };
+  props.dressing = one((p) => {
+    cloth(p, rbox(0, 0, 0, 0.09, 0.012, 0.068, 0.004), 0xa89e7a);
+    cloth(p, rbox(0, -0.006, 0, 0.078, 0.003, 0.058, 0.0012), 0xe2dccb);
+  });
+  // bandage: the roll (along x), the strip being paid out, the turns that build up on the forearm
+  props.roll = one((p) => cloth(p, lathe([[0.0055, -0.034], [0.019, -0.035], [0.0215, -0.033], [0.0215, 0.033], [0.019, 0.035], [0.0055, 0.034], [0.0055, -0.034]], { seg: 20, axis: 'x+' }), 0xe6e0d0, { crease: 60 }));
+  props.strip = one((p) => cloth(p, rbox(0, 0, -0.5, 0.06, 0.0016, 1.0, 0.0006), 0xe6e0d0));
+  props.wraps = [];
+  for (let i = 0; i < 5; i++) { const z0 = 0.04 + i * 0.028; props.wraps.push(one((p) => cloth(p, armBand(z0, z0 + 0.044, 0.0105 + i * 0.0008), i % 2 ? 0xd2ccba : 0xdbd5c4))); }
+  // windlass tourniquet round the forearm near the elbow: rod over the top (+Y), clip beside it
+  const TZ = 0.215, tq = sleeveAt(TZ + 0.019, 0.01), top = tq.c[1] + tq.h / 2;
+  const tqp = two((p) => {
+    p.add(armBand(TZ, TZ + 0.038, 0.01), M.cloth, { col: 0x1e1f1c, crease: 50 });
+    poly(p, rbox(tq.c[0], top + 0.002, TZ + 0.019, 0.05, 0.006, 0.03, 0.002), 0x262725);
+    for (const s of [-1, 1]) poly(p, rbox(tq.c[0] + 0.058, top - 0.002 + s * 0.008, TZ + 0.019, 0.014, 0.005, 0.03, 0.0015), 0x222321);
+    cloth(p, rbox(tq.c[0] - 0.042, top - 0.004, TZ + 0.019, 0.02, 0.003, 0.026, 0.001), 0xe2e0d8);
+  }, (p) => poly(p, rbox(tq.c[0], top + 0.009, TZ + 0.019, 0.1, 0.0105, 0.0115, 0.004), 0x1b1c1b, { wear: 0.3, wearCol: 0x4a4b48 }), [tq.c[0], top + 0.009, TZ + 0.019]);
+  props.tourniquet = { root: tqp.root, rod: tqp.moving, side: [tq.c[0] + tq.w / 2, tq.c[1], TZ + 0.019] };
+  // plate carrier front at the chest: top edge (the pocket mouth) at y = 0, webbing below
+  props.carrier = one((p) => {
+    cloth(p, rbox(0, -0.16, -0.02, 0.32, 0.32, 0.016, 0.008), 0x5f6345);                       // outer panel
+    cloth(p, rbox(0, -0.002, -0.02, 0.322, 0.008, 0.02, 0.004), 0x2c2e24);                       // binding on its top edge
+    cloth(p, rbox(0, -0.18, 0.019, 0.3, 0.3, 0.012, 0.006), 0x53573c);                           // inner panel, against the chest
+    cloth(p, rbox(0, -0.032, 0.019, 0.302, 0.008, 0.016, 0.004), 0x2c2e24);
+    for (const s of [-1, 1]) cloth(p, rbox(s * 0.156, -0.17, 0, 0.012, 0.3, 0.05, 0.005), 0x4c5036);   // side seams
+    for (const s of [-1, 1]) cloth(p, rbox(s * 0.1, 0.02, 0.022, 0.05, 0.07, 0.008, 0.004), 0x4c5036);   // shoulder straps rising off the inner panel
+  });
+  // cleaning rod: handle in the fist at the origin, rod forward, bore brush on the tip
+  props.rod = one((p) => {
+    poly(p, lathe([[0, -0.03], [0.0085, -0.03], [0.0095, -0.024], [0.0095, 0.05], [0.0085, 0.056], [0, 0.056]], { seg: 14, axis: 'zb' }), 0x26231f);
+    p.add(lathe([[0.0027, 0.024], [0.0027, 0.3]], { seg: 10 }), M.steel, { col: 0x8d9195, wear: 0.4, wearCol: 0xc0c4c8 });
+    p.add(lathe([[0, 0.29], [0.0058, 0.293], [0.0062, 0.33], [0.004, 0.336], [0, 0.337]], { seg: 14 }), M.brass, { col: 0x8a7240, crease: 70 });
+  });
+  // clacker (firing device): squeeze lever under the body, hinged at its back end; wire out of the front
+  const clk = two((p) => {
+    poly(p, rbox(0, 0, 0, 0.034, 0.03, 0.1, 0.006), 0x4b5236, { wear: 0.4, wearCol: 0x6d7257 });
+    poly(p, rbox(0, 0.0165, 0.01, 0.022, 0.004, 0.05, 0.002), 0x3d4230);
+    rub(p, lathe([[0, 0], [0.004, 0], [0.004, 0.012], [0, 0.012]], { seg: 10, at: [0, 0.002, -0.05] }), 0x1f2020);
+    rub(p, loft([[0, 0.002, -0.06], [0.004, -0.004, -0.1], [0.02, -0.03, -0.14], [0.05, -0.08, -0.16], [0.09, -0.16, -0.15]].map((c) => ({ c, w: 0.0045, h: 0.0045, r: 0.002 })), { cap0: 'flat', cap1: 'flat', cseg: 2 }), 0x1b1d1a, { crease: 60 });
+  }, (p) => {
+    poly(p, rbox(0, -0.022, 0.002, 0.026, 0.008, 0.088, 0.003), 0x3a3f2c, { wear: 0.4, wearCol: 0x5e634c });
+    p.add(rbox(0, -0.019, 0.044, 0.03, 0.01, 0.008, 0.003), M.steel, { col: 0x3c3e3e });
+  }, [0, -0.016, 0.046]);
+  props.clacker = { root: clk.root, lever: clk.moving };
+  return { hands, props, section: sleeveAt, ms: Math.round(performance.now() - t0) };
+}

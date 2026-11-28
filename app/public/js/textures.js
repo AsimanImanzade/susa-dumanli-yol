@@ -674,3 +674,344 @@ export async function initTextures(renderer, manifest) {
   }));
   return Promise.all(jobs).then(() => report);
 }
+
+// ───────────────────────────── interiors: floorboards, wallpaper, veneer, carpets, pictures ─────────────────────────────
+/*
+ * Built on the main thread the first time a level with enterable houses is finalised, then kept for
+ * every later level: floorboards and the carpet atlas 1024 px, wallpaper and veneer 512 px (halved on
+ * Low). Colour, normal and roughness of a surface come from one height field, like the world set.
+ */
+const ih = (x, y, s) => { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1442695041); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+/** periodic value noise: u, v in [0,1) tile with px × py cells per repeat */
+function pvn(u, v, px, py, s) {
+  const x = u * px, y = v * py, xi = Math.floor(x), yi = Math.floor(y), tx = x - xi, ty = y - yi;
+  const sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
+  const x0 = ((xi % px) + px) % px, x1 = (x0 + 1) % px, y0 = ((yi % py) + py) % py, y1 = (y0 + 1) % py;
+  const a = ih(x0, y0, s), b = ih(x1, y0, s), c = ih(x0, y1, s), d = ih(x1, y1, s);
+  return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+}
+function pfb(u, v, px, py, oct, s) { let t = 0, amp = 0.5, n = 0; for (let o = 0; o < oct; o++) { t += pvn(u, v, px << o, py << o, s + o * 17) * amp; n += amp; amp *= 0.5; } return t / n; }
+const sst = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+function seeded(seed) { let s = seed >>> 0 || 1; return () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296; }
+
+/** colour (sRGB bytes), height and roughness arrays → tiling DataTextures (rows top-down, flipY off) */
+function packMaps(N, col, hgt, rough, nk, aniso) {
+  const n = N * N, nrm = new Uint8Array(n * 4), rg = new Uint8Array(n * 4), M = N - 1;
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const i = y * N + x, q = i * 4;
+    const dx = (hgt[y * N + ((x + 1) & M)] - hgt[y * N + ((x - 1) & M)]) * nk, dy = (hgt[((y + 1) & M) * N + x] - hgt[((y - 1) & M) * N + x]) * nk;
+    const l = 1 / Math.sqrt(dx * dx + dy * dy + 1);
+    nrm[q] = (-dx * l * 0.5 + 0.5) * 255; nrm[q + 1] = (-dy * l * 0.5 + 0.5) * 255; nrm[q + 2] = (l * 0.5 + 0.5) * 255; nrm[q + 3] = 255;
+    rg[q] = 255; rg[q + 1] = Math.min(1, Math.max(0, rough[i])) * 255; rg[q + 3] = 255;
+  }
+  const mk = (bytes, cs) => { const t = new THREE.DataTexture(bytes, N, N, THREE.RGBAFormat, THREE.UnsignedByteType); t.flipY = false; t.needsUpdate = true; return tiled(t, aniso, cs); };
+  return { map: mk(col, THREE.SRGBColorSpace), normal: mk(nrm, THREE.NoColorSpace), rough: mk(rg, THREE.NoColorSpace) };
+}
+const put3 = (col, i, r, g, b) => { const q = i * 4; col[q] = r * 255; col[q + 1] = g * 255; col[q + 2] = b * 255; col[q + 3] = 255; };
+
+/** Floorboards, one repeat = 2.4 m: 16 boards along v, butt joints, grain round the odd knot, nails over the joists. */
+function floorMaps(N, aniso) {
+  const n = N * N, col = new Uint8ClampedArray(n * 4), hgt = new Float32Array(n), rough = new Float32Array(n);
+  const NP = 16, r = seeded(911), boards = [], pw = N / NP;
+  for (let i = 0; i < NP; i++) {
+    const nj = r() < 0.55 ? 2 : 1, j0 = r(), joints = [];
+    for (let k = 0; k < nj; k++) joints.push((j0 + k / nj + (r() - 0.5) * 0.18 + 1) % 1);
+    joints.sort((a, b) => a - b);
+    boards.push({ joints, seg: joints.map(() => ({ tone: 0.8 + r() * 0.34, warm: (r() - 0.5) * 0.12, off: r() * 7, knot: r() < 0.4 ? [r() * 0.5 + 0.15, 0.25 + r() * 0.5] : null })) });
+  }
+  for (let y = 0; y < N; y++) {
+    const v = y / N;
+    for (let x = 0; x < N; x++) {
+      const u = x / N, pu = u * NP, pi = Math.floor(pu), fu = pu - pi, P = boards[pi];
+      let si = P.joints.length - 1, dj = 1;
+      for (let k = 0; k < P.joints.length; k++) { if (v >= P.joints[k]) si = k; const d = Math.abs(v - P.joints[k]); dj = Math.min(dj, d, 1 - d); }
+      const S = P.seg[si];
+      let kn = 0, swirl = 0;
+      if (S.knot) {
+        const vk = (P.joints[si] + S.knot[0]) % 1, dv = Math.abs(v - vk), dkv = Math.min(dv, 1 - dv) * N, dku = (fu - S.knot[1]) * pw;
+        const e = (dku / 4.5) ** 2 + (dkv / 10) ** 2;
+        kn = e < 1 ? 1 - e : 0; swirl = 1.6 / (e + 0.35);
+      }
+      const warp = pfb(u, v, NP, 4, 3, 17 + pi * 3);
+      const ph = fu * 3.2 + warp * 2.6 + S.off + v * 0.6 + swirl;
+      const ring = Math.pow(0.5 + 0.5 * Math.sin(ph * 6.2832), 4);
+      const fine = pvn(u, v, N / 2, 6, 23 + pi), wear = pfb(u, v, 3, 3, 3, 41);
+      const edge = Math.min(fu, 1 - fu) * pw, seam = Math.min(sst(0.5, 1.7, edge), sst(0.6, 1.9, dj * N));
+      let nail = 0;
+      for (let jv = 0; jv < 4; jv++) {
+        const dvp = (v - (jv + 0.5) / 4) * N;
+        if (Math.abs(dvp) > 3) continue;
+        for (const nu of [0.2, 0.8]) { const dup = (fu - nu) * pw, d2 = dup * dup + dvp * dvp; if (d2 < 4.5) nail = Math.max(nail, 1 - d2 / 4.5); }
+      }
+      let k = S.tone * (1 - 0.2 * ring) * (0.92 + 0.12 * fine) * (0.9 + 0.16 * wear) * (1 - 0.45 * kn);
+      k *= (0.3 + 0.7 * seam) * (1 - 0.55 * nail);
+      const i = y * N + x;
+      put3(col, i, Math.min(1, 0.74 * k * (1 + S.warm)), 0.55 * k, Math.min(1, 0.38 * k * (1 - S.warm)));
+      hgt[i] = seam * (1 - 0.05 * ring) - nail * 0.3;
+      rough[i] = 0.46 + 0.2 * (1 - wear) + (1 - seam) * 0.4 + ring * 0.06;
+    }
+  }
+  return packMaps(N, col, hgt, rough, 3.2 * N / 1024, aniso);
+}
+
+/** Embossed wallpaper, one repeat ≈ 0.56 m: rosettes in a half-drop between narrow double stripes, tone on tone (tinted per room). */
+function paperMaps(N, aniso) {
+  const n = N * N, col = new Uint8ClampedArray(n * 4), hgt = new Float32Array(n), rough = new Float32Array(n);
+  const wrap = (d) => d - Math.round(d);
+  for (let y = 0; y < N; y++) {
+    const v = y / N;
+    for (let x = 0; x < N; x++) {
+      const u = x / N;
+      // stripes at u = 0 and 0.5
+      const ds = Math.abs(wrap(u * 2) / 2) * N, stripe = Math.max(1 - sst(0.6, 1.6, Math.abs(ds - 5)), 1 - sst(0.6, 1.6, Math.abs(ds - 9)));
+      // rosettes at (0.25, 0.25) and (0.75, 0.75), vines between them
+      let m = 0;
+      for (const [cx, cy] of [[0.25, 0.25], [0.75, 0.75], [0.25, 1.25], [0.75, -0.25]]) {
+        const dx = wrap(u - cx), dy = v - cy - Math.round(v - cy), rr = Math.hypot(dx, dy * 0.85), th = Math.atan2(dy, dx);
+        const petal = rr < 0.062 * (0.68 + 0.32 * Math.cos(6 * th)) ? 1 : 0;
+        const ring = 1 - sst(0.003, 0.0065, Math.abs(rr - 0.094));
+        const core = rr < 0.018 ? 1 : 0;
+        // leaf pairs above and below
+        let leaf = 0;
+        for (const sg of [-1, 1]) for (const sx of [-1, 1]) { const lx = dx - sx * 0.045, ly = dy - sg * 0.15; const e = (lx * Math.cos(0.7 * sx * sg) + ly * Math.sin(0.7 * sx * sg)) ** 2 / 0.0011 + (-lx * Math.sin(0.7 * sx * sg) + ly * Math.cos(0.7 * sx * sg)) ** 2 / 0.00018; if (e < 1) leaf = 1; }
+        m = Math.max(m, petal * (core ? 0.5 : 1), ring, leaf * 0.85);
+      }
+      const vx = Math.abs(wrap(u * 2 - 0.5) / 2 - 0.022 * Math.sin(v * 6.2832 * 2)), vine = 1 - sst(0.0025, 0.005, vx);
+      m = Math.max(m, vine * 0.8);
+      const grain = 0.97 + 0.05 * pvn(u, v, 96, 96, 5) + 0.02 * pvn(u, v, 7, 7, 9);
+      const k = grain * (1 - 0.1 * m - 0.12 * stripe);
+      const i = y * N + x;
+      put3(col, i, 0.95 * k, 0.92 * k * (1 - 0.03 * m), 0.86 * k * (1 - 0.08 * m));
+      hgt[i] = m * 0.6 + stripe * 0.2 + grain * 0.15;
+      rough[i] = 0.86 - m * 0.18;
+    }
+  }
+  return packMaps(N, col, hgt, rough, 1.4 * N / 512, aniso);
+}
+
+/** Lacquered veneer, one repeat ≈ 0.9 m, grain along u. */
+function veneerMaps(N, aniso) {
+  const n = N * N, col = new Uint8ClampedArray(n * 4), hgt = new Float32Array(n), rough = new Float32Array(n);
+  for (let y = 0; y < N; y++) {
+    const v = y / N;
+    for (let x = 0; x < N; x++) {
+      const u = x / N, warp = pfb(u, v, 2, 6, 4, 61);
+      const ring = Math.pow(0.5 + 0.5 * Math.sin((v * 14 + warp * 3.2) * 6.2832), 3), pores = pvn(u, v, 6, N / 2, 67), cloud = pfb(u, v, 3, 3, 2, 71);
+      const k = (0.86 - 0.24 * ring) * (0.93 + 0.1 * pores) * (0.93 + 0.12 * cloud), i = y * N + x;
+      put3(col, i, 0.68 * k, 0.47 * k, 0.3 * k);
+      hgt[i] = -0.12 * ring + 0.06 * pores;
+      rough[i] = 0.36 + 0.12 * ring + 0.06 * pores;
+    }
+  }
+  return packMaps(N, col, hgt, rough, 1.2 * N / 512, aniso);
+}
+
+// carpet atlas (1024 units; v = 1 − y/1024 since canvas textures upload flipped)
+/** the three carpets (x, y, w, h, border) and the runner, whose middle repeats along its length */
+export const CARPET_CELLS = [
+  { x: 0, y: 0, w: 512, h: 512, b: 76 }, { x: 512, y: 0, w: 512, h: 512, b: 76 }, { x: 0, y: 512, w: 512, h: 512, b: 76 },
+  { x: 512, y: 512, w: 512, h: 192, b: 32 },
+];
+/** framed pictures (landscapes, still lifes), then the map and the clock dial */
+export const PICTURE_CELLS = Array.from({ length: 8 }, (_, i) => ({ x: 512 + (i % 4) * 128, y: 704 + Math.floor(i / 4) * 160, w: 128, h: 160 }));
+const CP = { red: '#8e2420', madder: '#7a1c1a', rust: '#a8452c', indigo: '#1f2a52', navy: '#161d38', ivory: '#e9ddc1', cream: '#d6c49a', yellow: '#cf9d3e', green: '#3f6b4c', teal: '#2d6a66', pink: '#c26a5c', brown: '#4e2f22', black: '#221a18' };
+
+function carpetAtlas(S, aniso) {
+  const c = document.createElement('canvas'); c.width = c.height = S;
+  const g = c.getContext('2d'), r = seeded(4242);
+  g.scale(S / 1024, S / 1024);
+  const poly = (pts, col) => { g.fillStyle = col; g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); g.fill(); };
+  const rect = (x, y, w, h, col) => { g.fillStyle = col; g.fillRect(x, y, w, h); };
+  const star8 = (x, y, rr, col) => { const p = []; for (let i = 0; i < 16; i++) { const a = i * Math.PI / 8, q = i % 2 ? rr * 0.48 : rr; p.push([x + Math.cos(a) * q, y + Math.sin(a) * q]); } poly(p, col); };
+  const diamond = (x, y, rx, ry, col) => poly([[x, y - ry], [x + rx, y], [x, y + ry], [x - rx, y]], col);
+  const stepped = (x, y, rx, ry, nS, col) => {
+    const q = [];
+    for (let i = 0; i < nS; i++) q.push([rx * i / nS, -ry * (1 - i / nS)], [rx * (i + 1) / nS, -ry * (1 - i / nS)]);
+    q.push([rx, 0]);
+    const rev = q.slice().reverse();
+    poly([...q.map(([a, b]) => [x + a, y + b]), ...rev.map(([a, b]) => [x + a, y - b]).slice(1), ...q.map(([a, b]) => [x - a, y - b]).slice(1), ...rev.map(([a, b]) => [x - a, y + b]).slice(1)], col);
+  };
+  const octagon = (x, y, rr, col) => { const p = []; for (let i = 0; i < 8; i++) { const a = (i + 0.5) * Math.PI / 4; p.push([x + Math.cos(a) * rr, y + Math.sin(a) * rr]); } poly(p, col); };
+  const circle = (x, y, rr, col) => { g.fillStyle = col; g.beginPath(); g.arc(x, y, rr, 0, Math.PI * 2); g.fill(); };
+  const gul = (x, y, rr, a, b, cc) => { octagon(x, y, rr, CP.ivory); octagon(x, y, rr * 0.86, a); diamond(x, y, rr * 0.62, rr * 0.62, b); star8(x, y, rr * 0.36, cc); };
+  const rosette = (x, y, rr, petal, mid, core) => { for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; circle(x + Math.cos(a) * rr * 0.62, y + Math.sin(a) * rr * 0.62, rr * 0.38, petal); } circle(x, y, rr * 0.5, mid); circle(x, y, rr * 0.22, core); };
+  /** border bands round a cell; motif(cx, cy, s, horiz) along the main band; returns the field rect */
+  const frame = (X, Y, W, H, B, pal, motif, period) => {
+    rect(X, Y, W, H, pal.outer);
+    const g1 = B * 0.12, m0 = B * 0.24, m1 = B * 0.8;
+    rect(X + g1, Y + g1, W - 2 * g1, H - 2 * g1, pal.guard);
+    rect(X + m0 - 2, Y + m0 - 2, W - 2 * m0 + 4, H - 2 * m0 + 4, pal.line);
+    rect(X + m0, Y + m0, W - 2 * m0, H - 2 * m0, pal.main);
+    const bw = m1 - m0;
+    for (const horiz of [true, false]) {
+      const len = horiz ? W - 2 * m0 : H - 2 * m0, nM = Math.max(1, Math.round(len / period)), step = len / nM;
+      for (let i = 0; i < nM; i++) {
+        const t = (horiz ? X : Y) + m0 + step * (i + 0.5);
+        if (horiz) { motif(t, Y + m0 + bw / 2, bw, true); motif(t, Y + H - m0 - bw / 2, bw, true); }
+        else { motif(X + m0 + bw / 2, t, bw, false); motif(X + W - m0 - bw / 2, t, bw, false); }
+      }
+    }
+    for (const [cx, cy] of [[X + m0 + bw / 2, Y + m0 + bw / 2], [X + W - m0 - bw / 2, Y + m0 + bw / 2], [X + m0 + bw / 2, Y + H - m0 - bw / 2], [X + W - m0 - bw / 2, Y + H - m0 - bw / 2]]) { rect(cx - bw / 2, cy - bw / 2, bw, bw, pal.main); star8(cx, cy, bw * 0.36, pal.accent); }
+    rect(X + m1 - 3, Y + m1 - 3, W - 2 * m1 + 6, H - 2 * m1 + 6, pal.line);
+    rect(X + m1, Y + m1, W - 2 * m1, H - 2 * m1, pal.guard2);
+    const f0 = B;
+    rect(X + f0, Y + f0, W - 2 * f0, H - 2 * f0, pal.field);
+    // abrash: the field's wool from different dye lots
+    for (let yy = Y + f0; yy < Y + H - f0; yy += 6) if (r() < 0.25) { g.fillStyle = r() < 0.5 ? 'rgba(0,0,0,0.06)' : 'rgba(255,240,220,0.05)'; g.fillRect(X + f0, yy, W - 2 * f0, 6 + Math.floor(r() * 10)); }
+    // tiny dots on the guards
+    const go = (gA, gB, lo, hi) => {
+      for (let t = lo; t < hi; t += 9) for (const e of [gA, gB]) { circle(X + t, Y + e, 1.6, pal.dot); circle(X + t, Y + H - e, 1.6, pal.dot); }
+      for (let t = lo; t < H - (W - hi); t += 9) for (const e of [gA, gB]) { circle(X + e, Y + t, 1.6, pal.dot); circle(X + W - e, Y + t, 1.6, pal.dot); }
+    };
+    go((g1 + m0) / 2, (g1 + m0) / 2, g1 + 4, W - g1 - 4);
+    go((m1 + f0) / 2, (m1 + f0) / 2, m1 + 4, W - m1 - 4);
+    return { x0: X + f0, y0: Y + f0, x1: X + W - f0, y1: Y + H - f0 };
+  };
+  const scatter = (F, n, avoid, draw) => { for (let i = 0, k = 0; i < n && k < n * 8; k++) { const x = F.x0 + 10 + r() * (F.x1 - F.x0 - 20), y = F.y0 + 10 + r() * (F.y1 - F.y0 - 20); if (avoid(x, y)) continue; draw(x, y); i++; } };
+
+  // A: madder field, stepped indigo medallion with pendants, spandrels in the corners, ivory crab border
+  {
+    const C = CARPET_CELLS[0];
+    const F = frame(C.x, C.y, C.w, C.h, C.b, { outer: CP.indigo, guard: CP.red, guard2: CP.red, line: CP.black, main: CP.ivory, field: CP.madder, accent: CP.red, dot: CP.ivory },
+      (x, y, s, h) => { diamond(x, y, s * 0.36, s * 0.36, CP.indigo); diamond(x, y, s * 0.2, s * 0.2, CP.red); for (const sg of [-1, 1]) { const dx = h ? sg * s * 0.42 : 0, dy = h ? 0 : sg * s * 0.42; star8(x + dx, y + dy, s * 0.09, CP.green); } }, 46);
+    const cx = (F.x0 + F.x1) / 2, cy = (F.y0 + F.y1) / 2, fw = F.x1 - F.x0, fh = F.y1 - F.y0;
+    for (const sx of [0, 1]) for (const sy of [0, 1]) {
+      const x = sx ? F.x1 : F.x0, y = sy ? F.y1 : F.y0;
+      g.save(); g.beginPath(); g.rect(F.x0, F.y0, fw, fh); g.clip();
+      stepped(x, y, fw * 0.24, fh * 0.2, 4, CP.ivory); stepped(x, y, fw * 0.19, fh * 0.155, 4, CP.indigo); stepped(x, y, fw * 0.1, fh * 0.08, 3, CP.yellow);
+      g.restore();
+    }
+    for (const sg of [-1, 1]) { stepped(cx, cy + sg * fh * 0.33, fw * 0.12, fh * 0.09, 3, CP.ivory); stepped(cx, cy + sg * fh * 0.33, fw * 0.09, fh * 0.065, 3, CP.teal); star8(cx, cy + sg * fh * 0.33, fw * 0.035, CP.ivory); rect(cx - 3, cy + sg * fh * 0.2 - 10, 6, 20, CP.ivory); }
+    stepped(cx, cy, fw * 0.34, fh * 0.24, 6, CP.ivory); stepped(cx, cy, fw * 0.31, fh * 0.215, 6, CP.indigo);
+    stepped(cx, cy, fw * 0.2, fh * 0.14, 4, CP.ivory); stepped(cx, cy, fw * 0.17, fh * 0.115, 4, CP.red);
+    star8(cx, cy, fw * 0.075, CP.ivory); star8(cx, cy, fw * 0.04, CP.indigo);
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) diamond(cx + dx * fw * 0.245, cy + dy * fh * 0.17, 7, 7, CP.yellow);
+    const inMed = (x, y) => Math.abs(x - cx) / (fw * 0.37) + Math.abs(y - cy) / (fh * 0.27) < 1 || Math.abs(x - cx) < fw * 0.15 && Math.abs(Math.abs(y - cy) - fh * 0.33) < fh * 0.12 || (Math.min(x - F.x0, F.x1 - x) / (fw * 0.26) + Math.min(y - F.y0, F.y1 - y) / (fh * 0.22) < 1);
+    scatter(F, 34, inMed, (x, y) => { const k = r(); if (k < 0.35) star8(x, y, 6, CP.ivory); else if (k < 0.6) diamond(x, y, 5, 8, CP.yellow); else if (k < 0.8) { diamond(x, y, 6, 6, CP.green); diamond(x, y, 2.5, 2.5, CP.ivory); } else rect(x - 2, y - 7, 4, 14, CP.indigo); });
+  }
+  // B: indigo field with rose medallions and sprays, red border with ivory rosettes
+  {
+    const C = CARPET_CELLS[1];
+    const F = frame(C.x, C.y, C.w, C.h, C.b, { outer: CP.madder, guard: CP.yellow, guard2: CP.yellow, line: CP.black, main: CP.red, field: CP.navy, accent: CP.ivory, dot: CP.red },
+      (x, y, s) => rosette(x, y, s * 0.3, CP.ivory, CP.pink, CP.yellow), 44);
+    const cx = (F.x0 + F.x1) / 2, cy = (F.y0 + F.y1) / 2, fw = F.x1 - F.x0, fh = F.y1 - F.y0;
+    circle(cx, cy, fw * 0.25, CP.ivory); circle(cx, cy, fw * 0.235, CP.red);
+    for (let i = 0; i < 12; i++) { const a = i * Math.PI / 6; circle(cx + Math.cos(a) * fw * 0.17, cy + Math.sin(a) * fw * 0.17, fw * 0.045, CP.pink); }
+    rosette(cx, cy, fw * 0.11, CP.ivory, CP.rust, CP.yellow);
+    for (const sg of [-1, 1]) { circle(cx, cy + sg * fh * 0.36, fw * 0.1, CP.ivory); rosette(cx, cy + sg * fh * 0.36, fw * 0.085, CP.pink, CP.red, CP.yellow); }
+    for (const [sx, sy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) { g.save(); g.beginPath(); g.rect(F.x0, F.y0, fw, fh); g.clip(); circle(sx ? F.x1 : F.x0, sy ? F.y1 : F.y0, fw * 0.16, CP.red); circle(sx ? F.x1 : F.x0, sy ? F.y1 : F.y0, fw * 0.11, CP.ivory); g.restore(); }
+    const avoid = (x, y) => Math.hypot(x - cx, y - cy) < fw * 0.28 || Math.hypot(x - cx, Math.abs(y - cy) - fh * 0.36) < fw * 0.13 || Math.min(Math.hypot(x - F.x0, y - F.y0), Math.hypot(x - F.x1, y - F.y0), Math.hypot(x - F.x0, y - F.y1), Math.hypot(x - F.x1, y - F.y1)) < fw * 0.19;
+    scatter(F, 26, avoid, (x, y) => { g.strokeStyle = CP.green; g.lineWidth = 2.5; g.beginPath(); g.moveTo(x - 9, y + 9); g.quadraticCurveTo(x, y + 2, x + 8, y - 8); g.stroke(); circle(x + 8, y - 8, 5.5, r() < 0.5 ? CP.pink : CP.rust); circle(x + 8, y - 8, 2.2, CP.yellow); diamond(x - 4, y + 2, 3, 6, CP.green); });
+  }
+  // C: red field with an indigo lattice, small güls in the lozenges, indigo border with a running-dog zigzag
+  {
+    const C = CARPET_CELLS[2];
+    const F = frame(C.x, C.y, C.w, C.h, C.b, { outer: CP.red, guard: CP.ivory, guard2: CP.ivory, line: CP.black, main: CP.indigo, field: CP.red, accent: CP.yellow, dot: CP.red },
+      (x, y, s, h) => { const a = s * 0.26; g.strokeStyle = CP.ivory; g.lineWidth = 4; g.beginPath(); if (h) { g.moveTo(x - 22, y + a); g.lineTo(x - 11, y - a); g.lineTo(x, y + a); g.lineTo(x + 11, y - a); g.lineTo(x + 22, y + a); } else { g.moveTo(x + a, y - 22); g.lineTo(x - a, y - 11); g.lineTo(x + a, y); g.lineTo(x - a, y + 11); g.lineTo(x + a, y + 22); } g.stroke(); }, 44);
+    const fw = F.x1 - F.x0, fh = F.y1 - F.y0, nx = 4, ny = 4, sx = fw / nx, sy = fh / ny;
+    g.save(); g.beginPath(); g.rect(F.x0, F.y0, fw, fh); g.clip();
+    g.strokeStyle = CP.indigo; g.lineWidth = 5;
+    for (let i = -ny; i <= nx + ny; i++) { g.beginPath(); g.moveTo(F.x0 + i * sx, F.y0); g.lineTo(F.x0 + (i - ny) * sx, F.y1); g.stroke(); g.beginPath(); g.moveTo(F.x0 + i * sx, F.y0); g.lineTo(F.x0 + (i + ny) * sx, F.y1); g.stroke(); }
+    const pals = [[CP.teal, CP.ivory, CP.red], [CP.yellow, CP.indigo, CP.ivory], [CP.ivory, CP.red, CP.indigo]];
+    for (let j = 0; j <= ny * 2; j++) for (let i = 0; i <= nx * 2; i++) if ((i + j) % 2 === 1) { const p = pals[(i + 2 * j) % 3]; gul(F.x0 + i * sx / 2, F.y0 + j * sy / 2, Math.min(sx, sy) * 0.2, p[0], p[1], p[2]); }
+    for (let j = 0; j <= ny; j++) for (let i = 0; i <= nx; i++) star8(F.x0 + i * sx, F.y0 + j * sy, 6, CP.yellow);
+    g.restore();
+  }
+  // D: the runner — red field, a row of güls whose period divides the field so the middle repeats seamlessly
+  {
+    const C = CARPET_CELLS[3];
+    const F = frame(C.x, C.y, C.w, C.h, C.b, { outer: CP.indigo, guard: CP.red, guard2: CP.red, line: CP.black, main: CP.ivory, field: CP.red, accent: CP.indigo, dot: CP.ivory },
+      (x, y, s) => { diamond(x, y, s * 0.3, s * 0.3, CP.indigo); diamond(x, y, s * 0.12, s * 0.12, CP.yellow); }, 26);
+    const fh = F.y1 - F.y0, cy = (F.y0 + F.y1) / 2, per = (F.x1 - F.x0) / 7;
+    for (let i = 0; i < 7; i++) { const x = F.x0 + per * (i + 0.5); gul(x, cy, fh * 0.32, i % 2 ? CP.teal : CP.indigo, i % 2 ? CP.ivory : CP.yellow, CP.red); star8(F.x0 + per * i, cy - fh * 0.32, 5, CP.ivory); star8(F.x0 + per * i, cy + fh * 0.32, 5, CP.ivory); }
+  }
+  // pictures: mountains, pomegranates, a lake, an autumn wood, roses, a village; then a map and the clock dial
+  const P = PICTURE_CELLS;
+  const lin = (x, y0, y1, stops) => { const gr = g.createLinearGradient(x, y0, x, y1); stops.forEach(([t, c2]) => gr.addColorStop(t, c2)); return gr; };
+  const ridge = (C, y, amp, col, seed) => { const rr = seeded(seed); const pts = [[C.x, C.y + C.h]]; for (let i = 0; i <= 16; i++) pts.push([C.x + C.w * i / 16, y - rr() * amp]); pts.push([C.x + C.w, C.y + C.h]); poly(pts, col); };
+  {
+    const C = P[0];
+    rect(C.x, C.y, C.w, C.h, lin(0, C.y, C.y + C.h * 0.6, [[0, '#8fb0c8'], [1, '#e8dcc0']]));
+    ridge(C, C.y + 60, 30, '#7d8ea6', 1); ridge(C, C.y + 82, 26, '#5f7088', 2); ridge(C, C.y + 108, 20, '#5b7a4a', 3); ridge(C, C.y + 130, 12, '#3e5a36', 4);
+    poly([[C.x + 70, C.y + 34], [C.x + 84, C.y + 52], [C.x + 56, C.y + 52]], '#f0eee8');
+    for (let i = 0; i < 6; i++) { const x = C.x + 10 + i * 21, y = C.y + 128 + (i % 2) * 8; poly([[x, y - 22], [x + 7, y], [x - 7, y]], '#2a3e26'); }
+  }
+  {
+    const C = P[1];
+    rect(C.x, C.y, C.w, C.h, lin(0, C.y, C.y + C.h, [[0, '#3a2a20'], [1, '#1c1410']]));
+    rect(C.x, C.y + 112, C.w, 48, '#5a3a24'); rect(C.x, C.y + 112, C.w, 4, '#7a5234');
+    poly([[C.x + 84, C.y + 112], [C.x + 112, C.y + 112], [C.x + 106, C.y + 62], [C.x + 98, C.y + 54], [C.x + 90, C.y + 62]], '#a8642e'); circle(C.x + 98, C.y + 54, 5, '#c07a3a');
+    for (const [x, y, rr] of [[34, 104, 15], [58, 108, 13], [46, 88, 12]]) { circle(C.x + x, C.y + y, rr, '#8e1e1c'); circle(C.x + x - rr * 0.3, C.y + y - rr * 0.35, rr * 0.35, '#c4483a'); poly([[C.x + x - 3, C.y + y - rr], [C.x + x + 3, C.y + y - rr], [C.x + x + 4, C.y + y - rr - 6], [C.x + x - 4, C.y + y - rr - 6]], '#5a1410'); }
+    for (let i = 0; i < 5; i++) circle(C.x + 70 + i * 4, C.y + 120 + (i % 2) * 3, 2.2, '#d64a48');
+  }
+  {
+    const C = P[2];
+    rect(C.x, C.y, C.w, C.h, lin(0, C.y, C.y + 80, [[0, '#a8c4d8'], [1, '#f2e6cc']]));
+    ridge(C, C.y + 76, 16, '#6c8a74', 5);
+    rect(C.x, C.y + 84, C.w, 40, lin(0, C.y + 84, C.y + 124, [[0, '#7aa0b8'], [1, '#3e6278']]));
+    ridge(C, C.y + 132, 8, '#4e6e3c', 6);
+    for (const x of [18, 30, 104]) { rect(C.x + x, C.y + 70, 3, 74, '#ece8de'); for (let k = 0; k < 6; k++) circle(C.x + x + (k % 2 ? 6 : -4), C.y + 66 + k * 9, 7, k % 2 ? '#7a9a3e' : '#5e8034'); }
+  }
+  {
+    const C = P[3];
+    rect(C.x, C.y, C.w, C.h, lin(0, C.y, C.y + C.h, [[0, '#d8c08a'], [1, '#6a4a2a']]));
+    poly([[C.x + 54, C.y + C.h], [C.x + 74, C.y + C.h], [C.x + 66, C.y + 96], [C.x + 62, C.y + 96]], '#c8a870');
+    for (let i = 0; i < 9; i++) { const x = C.x + 8 + i * 14 + (i % 3) * 2; rect(x, C.y + 50, 4, 70, '#3a2818'); for (let k = 0; k < 4; k++) circle(x + (k % 2 ? 7 : -5), C.y + 42 + k * 10 + (i % 2) * 6, 10, ['#c8641e', '#d8a02a', '#a8401a', '#e0b84a'][(i + k) % 4]); }
+  }
+  {
+    const C = P[4];
+    rect(C.x, C.y, C.w, C.h, lin(0, C.y, C.y + C.h, [[0, '#2e4a3a'], [1, '#18261e']]));
+    poly([[C.x + 50, C.y + 150], [C.x + 78, C.y + 150], [C.x + 84, C.y + 112], [C.x + 72, C.y + 96], [C.x + 56, C.y + 96], [C.x + 44, C.y + 112]], '#d8dce4'); rect(C.x + 50, C.y + 116, 28, 6, '#3a5a9a');
+    for (const [x, y, c2] of [[52, 70, '#b8202a'], [72, 62, '#d84858'], [62, 46, '#b8202a'], [42, 52, '#e8a0a8'], [84, 80, '#d84858'], [38, 80, '#b8202a']]) { circle(C.x + x + 4, C.y + y + 12, 6, '#3e7a3a'); circle(C.x + x, C.y + y, 9, c2); circle(C.x + x - 2, C.y + y - 2, 4, '#f0c0c0'); }
+  }
+  {
+    const C = P[5];
+    rect(C.x, C.y, C.w, C.h, lin(0, C.y, C.y + 70, [[0, '#9cb8d0'], [1, '#efe2c4']]));
+    ridge(C, C.y + 70, 22, '#7a9a6a', 7); ridge(C, C.y + 104, 14, '#6a8a4a', 8);
+    for (let i = 0; i < 5; i++) { const x = C.x + 14 + i * 22, y = C.y + 98 - (i % 2) * 14; rect(x, y, 16, 12, '#e8dcc4'); poly([[x - 2, y], [x + 8, y - 8], [x + 18, y]], '#a8442e'); rect(x + 6, y + 5, 4, 7, '#4a3020'); }
+    for (const x of [8, 112]) poly([[C.x + x, C.y + 66], [C.x + x + 5, C.y + 120], [C.x + x - 5, C.y + 120]], '#2e4a2a');
+    ridge(C, C.y + 136, 6, '#4a6a34', 9);
+  }
+  {
+    const C = P[6];
+    rect(C.x, C.y, C.w, C.h, '#ddd4b4');
+    for (const [x, y, rr] of [[40, 50, 26], [96, 110, 30], [30, 128, 18]]) for (let k = 4; k > 0; k--) { g.strokeStyle = '#9a7a52'; g.lineWidth = 1; g.beginPath(); g.ellipse(C.x + x, C.y + y, rr * k / 4, rr * k / 5, 0.4, 0, Math.PI * 2); g.stroke(); }
+    g.fillStyle = 'rgba(80,140,70,0.35)'; g.beginPath(); g.ellipse(C.x + 70, C.y + 60, 30, 20, 0.3, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = '#3c6ca8'; g.lineWidth = 3; g.beginPath(); g.moveTo(C.x, C.y + 92); g.bezierCurveTo(C.x + 40, C.y + 70, C.x + 70, C.y + 130, C.x + 128, C.y + 100); g.stroke();
+    g.strokeStyle = 'rgba(60,60,60,0.35)'; g.lineWidth = 1; for (let k = 1; k < 4; k++) { g.beginPath(); g.moveTo(C.x + k * 32, C.y); g.lineTo(C.x + k * 32, C.y + C.h); g.stroke(); g.beginPath(); g.moveTo(C.x, C.y + k * 40); g.lineTo(C.x + C.w, C.y + k * 40); g.stroke(); }
+    g.strokeStyle = '#b8282a'; g.lineWidth = 2.5; g.beginPath(); g.moveTo(C.x + 20, C.y + 140); g.lineTo(C.x + 60, C.y + 100); g.lineTo(C.x + 54, C.y + 112); g.moveTo(C.x + 60, C.y + 100); g.lineTo(C.x + 48, C.y + 102); g.stroke();
+    for (const [x, y] of [[84, 40], [100, 52], [22, 70]]) rect(C.x + x, C.y + y, 9, 6, '#2a4a9a');
+  }
+  {
+    const C = P[7], cx = C.x + 64, cy = C.y + 80;
+    rect(C.x, C.y, C.w, C.h, '#5a3a26');
+    circle(cx, cy, 60, '#b8964e'); circle(cx, cy, 55, '#efe6d0');
+    for (let i = 0; i < 60; i++) { const a = i * Math.PI / 30, big = i % 5 === 0, r0 = big ? 42 : 48; g.strokeStyle = '#2a2420'; g.lineWidth = big ? (i % 15 === 0 ? 4.5 : 3) : 1.2; g.beginPath(); g.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); g.lineTo(cx + Math.cos(a) * 52, cy + Math.sin(a) * 52); g.stroke(); }
+    circle(cx, cy, 4, '#2a2420');
+  }
+  // wool: knots on a 2-px grid, rows of pile, soft fuzz (pictures get a lighter canvas grain)
+  const img = g.getImageData(0, 0, S, S), d = img.data, k2 = 1024 / S;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const X = x * k2, Y = y * k2, pic = X >= 512 && Y >= 704, kn = ih(x >> 1, y >> 1, 7), fz = ih(x >> 3, y >> 3, 11);
+    const k = pic ? 0.95 + 0.06 * kn : (0.86 + 0.14 * kn) * ((y & 1) ? 0.97 : 1.02) * (0.95 + 0.08 * fz), q = (y * S + x) * 4;
+    d[q] *= k; d[q + 1] *= k; d[q + 2] *= k;
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = aniso;
+  t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  t.minFilter = THREE.LinearMipmapLinearFilter; t.magFilter = THREE.LinearFilter; t.generateMipmaps = true;
+  return t;
+}
+
+let INT = null;
+/** The interior set, built once: { floor, paper, veneer: { map, normal, rough }, carpet: atlas texture, ms } */
+export function interiorTextures() {
+  if (INT) return INT;
+  const t0 = performance.now(), low = G.texDetail === 'low', big = low ? 512 : 1024, small = big / 2;
+  const aniso = Math.min(8, G.renderer && G.renderer.capabilities ? G.renderer.capabilities.getMaxAnisotropy() : 4);
+  INT = { floor: floorMaps(big, aniso), paper: paperMaps(small, aniso), veneer: veneerMaps(small, aniso), carpet: carpetAtlas(big, aniso) };
+  INT.ms = Math.round(performance.now() - t0);
+  if (G.debug) console.info(`[textures] interior set built in ${INT.ms} ms at ${big}px`);
+  return INT;
+}
